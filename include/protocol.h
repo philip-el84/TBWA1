@@ -8,8 +8,12 @@ constexpr uint8_t SLAVE_ID = 45;
 struct __attribute__((packed)) SensorPacket {
   uint32_t uptime_ms;
   uint8_t tank_full;
-  uint8_t valid_mask;
-  float temp_c[2];
+  uint16_t moisture_raw[2];
 };
 
-static_assert(sizeof(SensorPacket) == 14, "Unexpected SensorPacket size");
+struct __attribute__((packed)) CommandPacket {
+  char text[64];
+};
+
+static_assert(sizeof(SensorPacket) == 9, "Unexpected SensorPacket size");
+static_assert(sizeof(CommandPacket) == 64, "Unexpected CommandPacket size");

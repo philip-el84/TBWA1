@@ -1,20 +1,24 @@
 #include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <PJONSoftwareBitBang.h>
 
 #include "protocol.h"
 
 namespace {
-constexpr uint8_t BUS_PIN = 16;
+constexpr uint8_t BUS_PIN = 13;
 constexpr uint8_t PUMP_PIN_1 = 25;
 constexpr uint8_t PUMP_PIN_2 = 26;
 constexpr uint8_t PUMP_PIN_3 = 27;
 constexpr uint8_t LED_PIN = 2;
+constexpr uint8_t ONE_WIRE_PIN = 4;
 
 constexpr uint8_t LED_ON = HIGH;
 constexpr uint8_t LED_OFF = LOW;
 
 constexpr TickType_t PUMP_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
+constexpr TickType_t TEMP_POLL_PERIOD = pdMS_TO_TICKS(10000);
 
 enum class PumpCommandType : uint8_t {
   SensorUpdate,
@@ -29,7 +33,7 @@ struct PumpCommand {
   PumpCommandType type;
   SensorPacket packet;
   uint8_t manual_mask;
-  float threshold_c;
+  uint16_t threshold_raw;
 };
 
 enum class LedEventType : uint8_t {
@@ -42,13 +46,16 @@ struct LedEvent {
 
 QueueHandle_t gPumpQueue = nullptr;
 QueueHandle_t gLedQueue = nullptr;
+QueueHandle_t gBusTxQueue = nullptr;
 TimerHandle_t gPumpTimeoutTimer = nullptr;
 PJONSoftwareBitBang bus(MASTER_ID);
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature ds18b20(&oneWire);
 
 void setPumps(bool p1_on, bool p2_on, bool p3_on) {
-  digitalWrite(PUMP_PIN_1, p1_on ? LOW : HIGH);
-  digitalWrite(PUMP_PIN_2, p2_on ? LOW : HIGH);
-  digitalWrite(PUMP_PIN_3, p3_on ? LOW : HIGH);
+  digitalWrite(PUMP_PIN_1, p1_on ? HIGH : LOW);
+  digitalWrite(PUMP_PIN_2, p2_on ? HIGH : LOW);
+  digitalWrite(PUMP_PIN_3, p3_on ? HIGH : LOW);
 }
 
 void setLed(bool on) {
@@ -83,15 +90,40 @@ void printHelp() {
   Serial.println(F("  mode manual"));
   Serial.println(F("  pump <1|2|3> <on|off>"));
   Serial.println(F("  pump all <on|off>"));
-  Serial.println(F("  threshold <degC>"));
+  Serial.println(F("  threshold <raw 0..4095>"));
   Serial.println(F("  timeout <sec>"));
+  Serial.println(F("  ping <text>"));
 }
 
 void Task_PJON_Comms(void *) {
+  CommandPacket outbound{};
+
   for (;;) {
+    while (xQueueReceive(gBusTxQueue, &outbound, 0) == pdPASS) {
+      bus.send(SLAVE_ID, reinterpret_cast<const uint8_t *>(outbound.text), strlen(outbound.text));
+    }
+
     bus.receive(50);
     bus.update();
     vTaskDelay(1);
+  }
+}
+
+void Task_Temperatures(void *) {
+  ds18b20.begin();
+
+  for (;;) {
+    ds18b20.requestTemperatures();
+    const uint8_t count = ds18b20.getDS18Count();
+    for (uint8_t i = 0; i < count; ++i) {
+      const float temp = ds18b20.getTempCByIndex(i);
+      if (temp > -126.0f && temp < 126.0f) {
+        Serial.printf("[TEMP] DS18B20[%u]=%.2fC\n", i, temp);
+      } else {
+        Serial.printf("[TEMP] DS18B20[%u]=invalid\n", i);
+      }
+    }
+    vTaskDelay(TEMP_POLL_PERIOD);
   }
 }
 
@@ -131,7 +163,7 @@ void Task_Pump_Logic(void *) {
   PumpCommand cmd{};
   bool autoMode = true;
   uint8_t manualMask = 0;
-  float thresholdC = 28.0f;
+  uint16_t thresholdRaw = 2200;
 
   for (;;) {
     if (xQueueReceive(gPumpQueue, &cmd, portMAX_DELAY) != pdPASS) {
@@ -157,8 +189,8 @@ void Task_Pump_Logic(void *) {
     }
 
     if (cmd.type == PumpCommandType::SetThreshold) {
-      thresholdC = cmd.threshold_c;
-      Serial.printf("[HMI] threshold=%.2fC\n", thresholdC);
+      thresholdRaw = cmd.threshold_raw;
+      Serial.printf("[HMI] threshold=%u\n", thresholdRaw);
       continue;
     }
 
@@ -199,15 +231,12 @@ void Task_Pump_Logic(void *) {
       continue;
     }
 
-    const bool t0_valid = (p.valid_mask & 0x01u) != 0u;
-    const bool t1_valid = (p.valid_mask & 0x02u) != 0u;
-    const bool pump1 = t0_valid && p.temp_c[0] > thresholdC;
-    const bool pump2 = t1_valid && p.temp_c[1] > thresholdC;
-    const bool pump3 = pump1 || pump2;
+    const bool pump1 = p.moisture_raw[0] < thresholdRaw;
+    const bool pump3 = p.moisture_raw[1] < thresholdRaw;
 
-    setPumps(pump1, pump2, pump3);
+    setPumps(pump1, false, pump3);
 
-    if (pump1 || pump2 || pump3) {
+    if (pump1 || pump3) {
       xTimerReset(gPumpTimeoutTimer, 0);
     } else {
       xTimerStop(gPumpTimeoutTimer, 0);
@@ -271,13 +300,13 @@ void Task_HMI(void *) {
             Serial.println(F("[HMI] invalid pump command"));
           }
         } else if (line.startsWith("threshold ")) {
-          float threshold = 0.0f;
-          if (sscanf(line.c_str(), "threshold %f", &threshold) == 1 && threshold >= 0.0f && threshold <= 80.0f) {
+          uint32_t threshold = 0;
+          if (sscanf(line.c_str(), "threshold %lu", &threshold) == 1 && threshold <= 4095) {
             cmd.type = PumpCommandType::SetThreshold;
-            cmd.threshold_c = threshold;
+            cmd.threshold_raw = static_cast<uint16_t>(threshold);
             xQueueSend(gPumpQueue, &cmd, pdMS_TO_TICKS(50));
           } else {
-            Serial.println(F("[HMI] threshold range 0..80"));
+            Serial.println(F("[HMI] threshold range 0..4095"));
           }
         } else if (line.startsWith("timeout ")) {
           uint32_t timeoutSec = 0;
@@ -286,6 +315,17 @@ void Task_HMI(void *) {
             Serial.printf("[HMI] timeout=%lus\n", static_cast<unsigned long>(timeoutSec));
           } else {
             Serial.println(F("[HMI] timeout range 1..600"));
+          }
+        } else if (line.startsWith("ping ")) {
+          String msg = line.substring(5);
+          msg.trim();
+          if (msg.length() == 0) {
+            Serial.println(F("[HMI] ping text missing"));
+          } else {
+            CommandPacket out{};
+            msg.toCharArray(out.text, sizeof(out.text));
+            xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(50));
+            Serial.printf("[HMI] ping -> '%s'\n", out.text);
           }
         } else {
           Serial.println(F("[HMI] unknown command"));
@@ -314,6 +354,7 @@ void setup() {
 
   gPumpQueue = xQueueCreate(16, sizeof(PumpCommand));
   gLedQueue = xQueueCreate(16, sizeof(LedEvent));
+  gBusTxQueue = xQueueCreate(8, sizeof(CommandPacket));
   gPumpTimeoutTimer = xTimerCreate("PumpTimeout", PUMP_TIMEOUT_TICKS, pdFALSE, nullptr, pumpTimeoutCallback);
 
   bus.strategy.set_pin(BUS_PIN);
@@ -324,6 +365,7 @@ void setup() {
   xTaskCreatePinnedToCore(Task_Pump_Logic, "Task_Pump_Logic", 4096, nullptr, tskIDLE_PRIORITY + 3, nullptr, 1);
   xTaskCreatePinnedToCore(Task_Status_LED, "Task_Status_LED", 2048, nullptr, tskIDLE_PRIORITY + 2, nullptr, 1);
   xTaskCreatePinnedToCore(Task_HMI, "Task_HMI", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Temperatures, "Task_Temperatures", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
 }
 
 void loop() {
