@@ -26,8 +26,10 @@ constexpr TickType_t BUS_HARD_RESET_TICKS = pdMS_TO_TICKS(30000);
 constexpr TickType_t BUS_REINIT_COOLDOWN_TICKS = pdMS_TO_TICKS(60000);
 constexpr TickType_t TELEMETRY_PERIOD_TICKS = pdMS_TO_TICKS(2000);
 constexpr TickType_t DS18_SAMPLE_PERIOD_TICKS = pdMS_TO_TICKS(2000);
-constexpr TickType_t BUS_PING_OFFLINE_TICKS = pdMS_TO_TICKS(2000);
-constexpr TickType_t BUS_PING_ONLINE_TICKS = pdMS_TO_TICKS(10000);
+constexpr TickType_t BUS_PING_OFFLINE_TICKS = pdMS_TO_TICKS(3000);
+constexpr TickType_t BUS_PING_ONLINE_TICKS = pdMS_TO_TICKS(15000);
+constexpr TickType_t BUS_POLL_OFFLINE_TICKS = pdMS_TO_TICKS(1000);
+constexpr TickType_t BUS_POLL_ONLINE_TICKS = pdMS_TO_TICKS(3000);
 
 struct SensorSnapshot {
   PayloadSensor packet;
@@ -83,6 +85,7 @@ volatile TickType_t gLastPacketTick = 0;
 std::atomic<uint32_t> gDroppedBusTxMessages{0};
 std::atomic<bool> gBusReinitRequested{false};
 std::atomic<uint32_t> gBusReinitCount{0};
+std::atomic<uint32_t> gPollRequestsSent{0};
 
 bool queueBusMessage(const uint8_t *data, uint16_t len, TickType_t timeoutTicks = pdMS_TO_TICKS(50)) {
   if (data == nullptr || len == 0 || len > kMaxTextPayload) {
@@ -128,6 +131,14 @@ void enqueueTextMessage(const String &msg) {
   trimmed.toCharArray(reinterpret_cast<char *>(&payload[1]), kMaxTextPayload - 1);
   payload[copied + 1] = '\0';
   queueBusMessage(payload, static_cast<uint16_t>(copied + 2));
+}
+
+
+void enqueuePollRequest() {
+  const uint8_t payload[1] = {static_cast<uint8_t>(PacketType::PollRequest)};
+  if (queueBusMessage(payload, sizeof(payload), pdMS_TO_TICKS(10))) {
+    gPollRequestsSent.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 void pumpTimeoutCallback(TimerHandle_t) {
@@ -191,13 +202,14 @@ void printTelemetryBlock(const char *reason) {
   const uint32_t packetAgeMs = (gLastPacketTick == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>((now - gLastPacketTick) * portTICK_PERIOD_MS);
   const bool online = (gLastPacketTick != 0) && ((now - gLastPacketTick) <= BUS_OK_AGE_TICKS);
 
-  Serial.printf("[TELEMETRY][%s] {heap:%u, slave:%s, packet_age_ms:%lu, dropped_bus_tx:%lu, bus_reinits:%lu, ds18_count:%u, ds18_0:%.2f, ds18_1:%.2f, adc_pa2:%u, adc_pa3:%u, tank_full:%u, pumps_mask:0x%02X}\n",
+  Serial.printf("[TELEMETRY][%s] {heap:%u, slave:%s, packet_age_ms:%lu, dropped_bus_tx:%lu, bus_reinits:%lu, poll_tx:%lu, ds18_count:%u, ds18_0:%.2f, ds18_1:%.2f, adc_pa2:%u, adc_pa3:%u, tank_full:%u, pumps_mask:0x%02X}\n",
                 reason,
                 static_cast<unsigned>(ESP.getFreeHeap()),
                 online ? "online" : "offline",
                 static_cast<unsigned long>(packetAgeMs),
                 static_cast<unsigned long>(gDroppedBusTxMessages.load(std::memory_order_relaxed)),
                 static_cast<unsigned long>(gBusReinitCount.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(gPollRequestsSent.load(std::memory_order_relaxed)),
                 static_cast<unsigned>(gTempSensorCount.load(std::memory_order_relaxed)),
                 gTemp0C.load(std::memory_order_relaxed),
                 gTemp1C.load(std::memory_order_relaxed),
@@ -211,10 +223,12 @@ void Task_Bus_Supervisor(void *) {
   TickType_t lastWake = xTaskGetTickCount();
   TickType_t lastStreamReqTick = 0;
   TickType_t lastPingTick = 0;
+  TickType_t lastPollTick = 0;
   TickType_t lastHardResetTick = 0;
   uint32_t pingCounter = 0;
 
   enqueueTextMessage("stream on");
+  enqueuePollRequest();
 
   for (;;) {
     const TickType_t now = xTaskGetTickCount();
@@ -224,6 +238,12 @@ void Task_Bus_Supervisor(void *) {
     if (!online && (lastStreamReqTick == 0 || (now - lastStreamReqTick) >= BUS_RECOVERY_TICKS)) {
       enqueueTextMessage("stream on");
       lastStreamReqTick = now;
+    }
+
+    const TickType_t pollPeriod = online ? BUS_POLL_ONLINE_TICKS : BUS_POLL_OFFLINE_TICKS;
+    if (lastPollTick == 0 || (now - lastPollTick) >= pollPeriod) {
+      enqueuePollRequest();
+      lastPollTick = now;
     }
 
     const TickType_t pingPeriod = online ? BUS_PING_ONLINE_TICKS : BUS_PING_OFFLINE_TICKS;

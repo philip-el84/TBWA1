@@ -39,6 +39,8 @@ QueueHandle_t gControlQueue = nullptr;
 QueueHandle_t gBusTxQueue = nullptr;
 PJONSoftwareBitBang bus(SLAVE_ID);
 volatile TickType_t gLastMasterPacketTick = 0;
+PayloadSensor gLastSample{};
+volatile bool gLastSampleValid = false;
 
 void setLed(bool on) { digitalWrite(LED_PIN, on ? LOW : HIGH); }
 
@@ -50,6 +52,14 @@ void queueTextReply(const char *text) {
   out.data[copyLen + 1] = '\0';
   out.len = static_cast<uint16_t>(copyLen + 2);
   xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(10));
+}
+
+
+
+void requestImmediateSensorSend() {
+  if (gLastSampleValid) {
+    xQueueOverwrite(gSensorQueue, &gLastSample);
+  }
 }
 
 void handleTextCommand(const char *text) {
@@ -112,6 +122,11 @@ void receiverFunction(uint8_t *payload, uint16_t length, const PJON_Packet_Info 
   gLastMasterPacketTick = xTaskGetTickCount();
 
   const PacketType type = static_cast<PacketType>(payload[0]);
+  if (type == PacketType::PollRequest) {
+    requestImmediateSensorSend();
+    return;
+  }
+
   if (type == PacketType::TextMessage && length > 1) {
     char text[kMaxTextPayload] = {0};
     const uint16_t copyLen = min<uint16_t>(length - 1, kMaxTextPayload - 1);
@@ -145,6 +160,8 @@ void Task_Sensors(void *) {
     packet.moisture_raw[0] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_1));
     packet.moisture_raw[1] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_2));
 
+    gLastSample = packet;
+    gLastSampleValid = true;
     xQueueOverwrite(gSensorQueue, &packet);
     vTaskDelayUntil(&lastWake, periodTicks);
   }
@@ -241,14 +258,14 @@ void setup() {
 
   analogReadResolution(12);
 
-  bus.strategy.set_pin(BUS_PIN);
-  bus.set_receiver(receiverFunction);
-  bus.begin();
-
   gSensorQueue = xQueueCreate(1, sizeof(PayloadSensor));
   gLedQueue = xQueueCreate(16, sizeof(LedEvent));
   gControlQueue = xQueueCreate(16, sizeof(ControlCommand));
   gBusTxQueue = xQueueCreate(8, sizeof(BusTxMessage));
+
+  bus.strategy.set_pin(BUS_PIN);
+  bus.set_receiver(receiverFunction);
+  bus.begin();
 
   xTaskCreate(Task_Sensors, "Task_Sensors", 512, nullptr, tskIDLE_PRIORITY + 2, nullptr);
   xTaskCreate(Task_PJON, "Task_PJON", 768, nullptr, configMAX_PRIORITIES - 1, nullptr);

@@ -9,6 +9,7 @@ constexpr size_t kMaxTextPayload = 80;
 enum class PacketType : uint8_t {
   SensorData = 0x01,
   TextMessage = 0x02,
+  PollRequest = 0x03,
 };
 
 struct __attribute__((packed)) PayloadSensor {
