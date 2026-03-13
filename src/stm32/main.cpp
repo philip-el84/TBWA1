@@ -14,8 +14,9 @@ constexpr uint8_t MOISTURE_PIN_2 = PA3;
 constexpr uint8_t LED_PIN = PC13;
 
 constexpr TickType_t SENSOR_POLL_NORMAL = pdMS_TO_TICKS(2000);
-constexpr TickType_t SENSOR_POLL_STREAM = pdMS_TO_TICKS(100);
+constexpr TickType_t SENSOR_POLL_STREAM = pdMS_TO_TICKS(250);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
+constexpr TickType_t HEARTBEAT_PERIOD_TICKS = pdMS_TO_TICKS(3000);
 
 struct LedEvent {
   enum Type : uint8_t { RxPacket, BlinkRequest } type;
@@ -37,6 +38,7 @@ QueueHandle_t gLedQueue = nullptr;
 QueueHandle_t gControlQueue = nullptr;
 QueueHandle_t gBusTxQueue = nullptr;
 PJONSoftwareBitBang bus(SLAVE_ID);
+volatile TickType_t gLastMasterPacketTick = 0;
 
 void setLed(bool on) { digitalWrite(LED_PIN, on ? LOW : HIGH); }
 
@@ -47,7 +49,7 @@ void queueTextReply(const char *text) {
   memcpy(&out.data[1], text, copyLen);
   out.data[copyLen + 1] = '\0';
   out.len = static_cast<uint16_t>(copyLen + 2);
-  xQueueSend(gBusTxQueue, &out, 0);
+  xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(10));
 }
 
 void handleTextCommand(const char *text) {
@@ -90,14 +92,12 @@ void handleTextCommand(const char *text) {
   }
 
   if (strncmp(text, "ping", 4) == 0) {
-    char pong[kMaxTextPayload - 1] = {0};
-    snprintf(pong, sizeof(pong), "pong %s", text);
-    queueTextReply(pong);
+    queueTextReply("pong");
     return;
   }
 
   char generic[kMaxTextPayload - 1] = {0};
-  snprintf(generic, sizeof(generic), "pong %s", text);
+  snprintf(generic, sizeof(generic), "ack %s", text);
   queueTextReply(generic);
 }
 
@@ -109,6 +109,7 @@ void receiverFunction(uint8_t *payload, uint16_t length, const PJON_Packet_Info 
   LedEvent ledEv{};
   ledEv.type = LedEvent::RxPacket;
   xQueueSend(gLedQueue, &ledEv, 0);
+  gLastMasterPacketTick = xTaskGetTickCount();
 
   const PacketType type = static_cast<PacketType>(payload[0]);
   if (type == PacketType::TextMessage && length > 1) {
@@ -146,6 +147,21 @@ void Task_Sensors(void *) {
 
     xQueueOverwrite(gSensorQueue, &packet);
     vTaskDelayUntil(&lastWake, periodTicks);
+  }
+}
+
+
+void Task_Heartbeat(void *) {
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;) {
+    const TickType_t now = xTaskGetTickCount();
+    if (gLastMasterPacketTick == 0 || (now - gLastMasterPacketTick) > BUS_OK_AGE_TICKS) {
+      char msg[kMaxTextPayload - 1] = {0};
+      snprintf(msg, sizeof(msg), "hb %lu", static_cast<unsigned long>(millis()));
+      queueTextReply(msg);
+    }
+    vTaskDelayUntil(&lastWake, HEARTBEAT_PERIOD_TICKS);
   }
 }
 
@@ -237,6 +253,7 @@ void setup() {
   xTaskCreate(Task_Sensors, "Task_Sensors", 512, nullptr, tskIDLE_PRIORITY + 2, nullptr);
   xTaskCreate(Task_PJON, "Task_PJON", 768, nullptr, configMAX_PRIORITIES - 1, nullptr);
   xTaskCreate(Task_Status_LED, "Task_Status_LED", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  xTaskCreate(Task_Heartbeat, "Task_Heartbeat", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
   vTaskStartScheduler();
 }
