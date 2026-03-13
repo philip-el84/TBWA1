@@ -21,8 +21,13 @@ constexpr uint8_t LED_OFF = LOW;
 
 constexpr TickType_t PUMP_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
+constexpr TickType_t BUS_RECOVERY_TICKS = pdMS_TO_TICKS(3000);
+constexpr TickType_t BUS_HARD_RESET_TICKS = pdMS_TO_TICKS(30000);
+constexpr TickType_t BUS_REINIT_COOLDOWN_TICKS = pdMS_TO_TICKS(60000);
 constexpr TickType_t TELEMETRY_PERIOD_TICKS = pdMS_TO_TICKS(2000);
 constexpr TickType_t DS18_SAMPLE_PERIOD_TICKS = pdMS_TO_TICKS(2000);
+constexpr TickType_t BUS_PING_OFFLINE_TICKS = pdMS_TO_TICKS(2000);
+constexpr TickType_t BUS_PING_ONLINE_TICKS = pdMS_TO_TICKS(10000);
 
 struct SensorSnapshot {
   PayloadSensor packet;
@@ -75,6 +80,26 @@ std::atomic<uint8_t> gTempSensorCount{0};
 std::atomic<uint8_t> gPumpMask{0};
 
 volatile TickType_t gLastPacketTick = 0;
+std::atomic<uint32_t> gDroppedBusTxMessages{0};
+std::atomic<bool> gBusReinitRequested{false};
+std::atomic<uint32_t> gBusReinitCount{0};
+
+bool queueBusMessage(const uint8_t *data, uint16_t len, TickType_t timeoutTicks = pdMS_TO_TICKS(50)) {
+  if (data == nullptr || len == 0 || len > kMaxTextPayload) {
+    return false;
+  }
+
+  BusTxMessage out{};
+  memcpy(out.data, data, len);
+  out.len = len;
+
+  if (xQueueSend(gBusTxQueue, &out, timeoutTicks) == pdPASS) {
+    return true;
+  }
+
+  gDroppedBusTxMessages.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
 
 void setPumps(bool p1_on, bool p2_on, bool p3_on) {
   digitalWrite(PUMP_PIN_1, p1_on ? HIGH : LOW);
@@ -96,13 +121,13 @@ void setPumps(bool p1_on, bool p2_on, bool p3_on) {
 void setLed(bool on) { digitalWrite(LED_PIN, on ? LED_ON : LED_OFF); }
 
 void enqueueTextMessage(const String &msg) {
-  BusTxMessage out{};
-  out.data[0] = static_cast<uint8_t>(PacketType::TextMessage);
-  const size_t copied = msg.substring(0, kMaxTextPayload - 2).length();
-  msg.substring(0, kMaxTextPayload - 2).toCharArray(reinterpret_cast<char *>(&out.data[1]), kMaxTextPayload - 1);
-  out.len = static_cast<uint16_t>(copied + 2);
-  out.data[out.len - 1] = '\0';
-  xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(50));
+  uint8_t payload[kMaxTextPayload] = {0};
+  payload[0] = static_cast<uint8_t>(PacketType::TextMessage);
+  const String trimmed = msg.substring(0, kMaxTextPayload - 2);
+  const size_t copied = trimmed.length();
+  trimmed.toCharArray(reinterpret_cast<char *>(&payload[1]), kMaxTextPayload - 1);
+  payload[copied + 1] = '\0';
+  queueBusMessage(payload, static_cast<uint16_t>(copied + 2));
 }
 
 void pumpTimeoutCallback(TimerHandle_t) {
@@ -166,11 +191,13 @@ void printTelemetryBlock(const char *reason) {
   const uint32_t packetAgeMs = (gLastPacketTick == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>((now - gLastPacketTick) * portTICK_PERIOD_MS);
   const bool online = (gLastPacketTick != 0) && ((now - gLastPacketTick) <= BUS_OK_AGE_TICKS);
 
-  Serial.printf("[TELEMETRY][%s] {heap:%u, slave:%s, packet_age_ms:%lu, ds18_count:%u, ds18_0:%.2f, ds18_1:%.2f, adc_pa2:%u, adc_pa3:%u, tank_full:%u, pumps_mask:0x%02X}\n",
+  Serial.printf("[TELEMETRY][%s] {heap:%u, slave:%s, packet_age_ms:%lu, dropped_bus_tx:%lu, bus_reinits:%lu, ds18_count:%u, ds18_0:%.2f, ds18_1:%.2f, adc_pa2:%u, adc_pa3:%u, tank_full:%u, pumps_mask:0x%02X}\n",
                 reason,
                 static_cast<unsigned>(ESP.getFreeHeap()),
                 online ? "online" : "offline",
                 static_cast<unsigned long>(packetAgeMs),
+                static_cast<unsigned long>(gDroppedBusTxMessages.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>(gBusReinitCount.load(std::memory_order_relaxed)),
                 static_cast<unsigned>(gTempSensorCount.load(std::memory_order_relaxed)),
                 gTemp0C.load(std::memory_order_relaxed),
                 gTemp1C.load(std::memory_order_relaxed),
@@ -178,6 +205,43 @@ void printTelemetryBlock(const char *reason) {
                 haveSnap ? snap.packet.moisture_raw[1] : 0,
                 haveSnap ? snap.packet.tank_full : 0,
                 gPumpMask.load(std::memory_order_relaxed));
+}
+
+void Task_Bus_Supervisor(void *) {
+  TickType_t lastWake = xTaskGetTickCount();
+  TickType_t lastStreamReqTick = 0;
+  TickType_t lastPingTick = 0;
+  TickType_t lastHardResetTick = 0;
+  uint32_t pingCounter = 0;
+
+  enqueueTextMessage("stream on");
+
+  for (;;) {
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t lastPacket = gLastPacketTick;
+    const bool online = (lastPacket != 0) && ((now - lastPacket) <= BUS_OK_AGE_TICKS);
+
+    if (!online && (lastStreamReqTick == 0 || (now - lastStreamReqTick) >= BUS_RECOVERY_TICKS)) {
+      enqueueTextMessage("stream on");
+      lastStreamReqTick = now;
+    }
+
+    const TickType_t pingPeriod = online ? BUS_PING_ONLINE_TICKS : BUS_PING_OFFLINE_TICKS;
+    if (lastPingTick == 0 || (now - lastPingTick) >= pingPeriod) {
+      enqueueTextMessage(String("ping ") + String(pingCounter++));
+      lastPingTick = now;
+    }
+
+    if (!online && lastPacket != 0 && (now - lastPacket) >= BUS_HARD_RESET_TICKS) {
+      if ((lastHardResetTick == 0) || ((now - lastHardResetTick) >= BUS_REINIT_COOLDOWN_TICKS)) {
+        Serial.println(F("[BUS] scheduling hard reset of PJON interface"));
+        gBusReinitRequested.store(true, std::memory_order_relaxed);
+        lastHardResetTick = now;
+      }
+    }
+
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(250));
+  }
 }
 
 void printBootManifest() {
@@ -200,6 +264,12 @@ void Task_PJON_Comms(void *) {
       if (outbound.len > 0) {
         bus.send(SLAVE_ID, outbound.data, outbound.len);
       }
+    }
+
+    if (gBusReinitRequested.exchange(false, std::memory_order_relaxed)) {
+      bus.begin();
+      gBusReinitCount.fetch_add(1, std::memory_order_relaxed);
+      Serial.println(F("[BUS] PJON interface restarted"));
     }
 
     bus.receive(20);
@@ -498,6 +568,7 @@ void setup() {
   xTaskCreatePinnedToCore(Task_HMI, "Task_HMI", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
   xTaskCreatePinnedToCore(Task_Temperatures, "Task_Temperatures", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
   xTaskCreatePinnedToCore(Task_Telemetry, "Task_Telemetry", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Bus_Supervisor, "Task_Bus_Supervisor", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
 }
 
 void loop() { vTaskDelay(portMAX_DELAY); }
