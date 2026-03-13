@@ -3,6 +3,7 @@
 #include <STM32FreeRTOS.h>
 
 #include <cstring>
+#include <atomic>
 
 #include "protocol.h"
 
@@ -17,6 +18,7 @@ constexpr TickType_t SENSOR_POLL_NORMAL = pdMS_TO_TICKS(2000);
 constexpr TickType_t SENSOR_POLL_STREAM = pdMS_TO_TICKS(250);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
 constexpr TickType_t HEARTBEAT_PERIOD_TICKS = pdMS_TO_TICKS(3000);
+constexpr TickType_t ANNOUNCE_SENSOR_TICKS = pdMS_TO_TICKS(1000);
 
 struct LedEvent {
   enum Type : uint8_t { RxPacket, BlinkRequest } type;
@@ -41,6 +43,7 @@ PJONSoftwareBitBang bus(SLAVE_ID);
 volatile TickType_t gLastMasterPacketTick = 0;
 PayloadSensor gLastSample{};
 volatile bool gLastSampleValid = false;
+std::atomic<uint32_t> gAnnounceCount{0};
 
 void setLed(bool on) { digitalWrite(LED_PIN, on ? LOW : HIGH); }
 
@@ -182,6 +185,20 @@ void Task_Heartbeat(void *) {
   }
 }
 
+
+
+void Task_Announce_Sensor(void *) {
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;) {
+    if (gLastSampleValid) {
+      xQueueOverwrite(gSensorQueue, &gLastSample);
+      gAnnounceCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    vTaskDelayUntil(&lastWake, ANNOUNCE_SENSOR_TICKS);
+  }
+}
+
 void Task_PJON(void *) {
   PayloadSensor packet{};
   BusTxMessage tx{};
@@ -271,6 +288,7 @@ void setup() {
   xTaskCreate(Task_PJON, "Task_PJON", 768, nullptr, configMAX_PRIORITIES - 1, nullptr);
   xTaskCreate(Task_Status_LED, "Task_Status_LED", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   xTaskCreate(Task_Heartbeat, "Task_Heartbeat", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  xTaskCreate(Task_Announce_Sensor, "Task_Announce_Sensor", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
   vTaskStartScheduler();
 }

@@ -22,8 +22,9 @@ constexpr uint8_t LED_OFF = LOW;
 constexpr TickType_t PUMP_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
 constexpr TickType_t BUS_RECOVERY_TICKS = pdMS_TO_TICKS(3000);
-constexpr TickType_t BUS_HARD_RESET_TICKS = pdMS_TO_TICKS(30000);
-constexpr TickType_t BUS_REINIT_COOLDOWN_TICKS = pdMS_TO_TICKS(60000);
+constexpr TickType_t BUS_HARD_RESET_TICKS = pdMS_TO_TICKS(20000);
+constexpr TickType_t BUS_REINIT_COOLDOWN_TICKS = pdMS_TO_TICKS(30000);
+constexpr TickType_t BUS_COLDSTART_REINIT_TICKS = pdMS_TO_TICKS(8000);
 constexpr TickType_t TELEMETRY_PERIOD_TICKS = pdMS_TO_TICKS(2000);
 constexpr TickType_t DS18_SAMPLE_PERIOD_TICKS = pdMS_TO_TICKS(2000);
 constexpr TickType_t BUS_PING_OFFLINE_TICKS = pdMS_TO_TICKS(3000);
@@ -86,6 +87,7 @@ std::atomic<uint32_t> gDroppedBusTxMessages{0};
 std::atomic<bool> gBusReinitRequested{false};
 std::atomic<uint32_t> gBusReinitCount{0};
 std::atomic<uint32_t> gPollRequestsSent{0};
+std::atomic<TickType_t> gBootTick{0};
 
 bool queueBusMessage(const uint8_t *data, uint16_t len, TickType_t timeoutTicks = pdMS_TO_TICKS(50)) {
   if (data == nullptr || len == 0 || len > kMaxTextPayload) {
@@ -202,7 +204,7 @@ void printTelemetryBlock(const char *reason) {
   const uint32_t packetAgeMs = (gLastPacketTick == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>((now - gLastPacketTick) * portTICK_PERIOD_MS);
   const bool online = (gLastPacketTick != 0) && ((now - gLastPacketTick) <= BUS_OK_AGE_TICKS);
 
-  Serial.printf("[TELEMETRY][%s] {heap:%u, slave:%s, packet_age_ms:%lu, dropped_bus_tx:%lu, bus_reinits:%lu, poll_tx:%lu, ds18_count:%u, ds18_0:%.2f, ds18_1:%.2f, adc_pa2:%u, adc_pa3:%u, tank_full:%u, pumps_mask:0x%02X}\n",
+  Serial.printf("[TELEMETRY][%s] {heap:%u, slave:%s, packet_age_ms:%lu, dropped_bus_tx:%lu, bus_reinits:%lu, poll_tx:%lu, boot_ms:%lu, ds18_count:%u, ds18_0:%.2f, ds18_1:%.2f, adc_pa2:%u, adc_pa3:%u, tank_full:%u, pumps_mask:0x%02X}\n",
                 reason,
                 static_cast<unsigned>(ESP.getFreeHeap()),
                 online ? "online" : "offline",
@@ -210,6 +212,7 @@ void printTelemetryBlock(const char *reason) {
                 static_cast<unsigned long>(gDroppedBusTxMessages.load(std::memory_order_relaxed)),
                 static_cast<unsigned long>(gBusReinitCount.load(std::memory_order_relaxed)),
                 static_cast<unsigned long>(gPollRequestsSent.load(std::memory_order_relaxed)),
+                static_cast<unsigned long>((now - gBootTick.load(std::memory_order_relaxed)) * portTICK_PERIOD_MS),
                 static_cast<unsigned>(gTempSensorCount.load(std::memory_order_relaxed)),
                 gTemp0C.load(std::memory_order_relaxed),
                 gTemp1C.load(std::memory_order_relaxed),
@@ -252,7 +255,10 @@ void Task_Bus_Supervisor(void *) {
       lastPingTick = now;
     }
 
-    if (!online && lastPacket != 0 && (now - lastPacket) >= BUS_HARD_RESET_TICKS) {
+    const bool neverReceivedPacket = (lastPacket == 0);
+    const bool staleLink = (!online && !neverReceivedPacket && (now - lastPacket) >= BUS_HARD_RESET_TICKS);
+    const bool coldStartTimeout = (neverReceivedPacket && (now - gBootTick.load(std::memory_order_relaxed)) >= BUS_COLDSTART_REINIT_TICKS);
+    if (staleLink || coldStartTimeout) {
       if ((lastHardResetTick == 0) || ((now - lastHardResetTick) >= BUS_REINIT_COOLDOWN_TICKS)) {
         Serial.println(F("[BUS] scheduling hard reset of PJON interface"));
         gBusReinitRequested.store(true, std::memory_order_relaxed);
@@ -562,6 +568,7 @@ void Task_HMI(void *) {
 
 void setup() {
   Serial.begin(115200);
+  gBootTick.store(xTaskGetTickCount(), std::memory_order_relaxed);
 
   pinMode(PUMP_PIN_1, OUTPUT);
   pinMode(PUMP_PIN_2, OUTPUT);
