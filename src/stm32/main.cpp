@@ -1,7 +1,8 @@
 #include <Arduino.h>
 #include <PJONSoftwareBitBang.h>
-
 #include <STM32FreeRTOS.h>
+
+#include <cstring>
 
 #include "protocol.h"
 
@@ -10,59 +11,159 @@ constexpr uint8_t BUS_PIN = PA0;
 constexpr uint8_t REED_PIN = PA1;
 constexpr uint8_t MOISTURE_PIN_1 = PA2;
 constexpr uint8_t MOISTURE_PIN_2 = PA3;
-constexpr uint8_t LED_PIN = PC13;  // Black Pill onboard LED (active low)
+constexpr uint8_t LED_PIN = PC13;
 
-constexpr TickType_t SENSOR_POLL_PERIOD = pdMS_TO_TICKS(2000);
+constexpr TickType_t SENSOR_POLL_NORMAL = pdMS_TO_TICKS(2000);
+constexpr TickType_t SENSOR_POLL_STREAM = pdMS_TO_TICKS(100);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
 
 struct LedEvent {
-  TickType_t tx_tick;
+  enum Type : uint8_t { RxPacket, BlinkRequest } type;
+  uint16_t blink_count;
+};
+
+struct ControlCommand {
+  enum Type : uint8_t { SetStream, BlinkLed } type;
+  uint16_t value;
+};
+
+struct BusTxMessage {
+  uint16_t len;
+  uint8_t data[kMaxTextPayload];
 };
 
 QueueHandle_t gSensorQueue = nullptr;
 QueueHandle_t gLedQueue = nullptr;
+QueueHandle_t gControlQueue = nullptr;
+QueueHandle_t gBusTxQueue = nullptr;
 PJONSoftwareBitBang bus(SLAVE_ID);
 
-void setLed(bool on) {
-  digitalWrite(LED_PIN, on ? LOW : HIGH);
+void setLed(bool on) { digitalWrite(LED_PIN, on ? LOW : HIGH); }
+
+void queueTextReply(const char *text) {
+  BusTxMessage out{};
+  out.data[0] = static_cast<uint8_t>(PacketType::TextMessage);
+  const size_t copyLen = strnlen(text, kMaxTextPayload - 2);
+  memcpy(&out.data[1], text, copyLen);
+  out.data[copyLen + 1] = '\0';
+  out.len = static_cast<uint16_t>(copyLen + 2);
+  xQueueSend(gBusTxQueue, &out, 0);
 }
 
-void receiverFunction(uint8_t *payload, uint16_t length, const PJON_Packet_Info &) {
-  if (length == 0) {
+void handleTextCommand(const char *text) {
+  if (strncmp(text, "blink ", 6) == 0) {
+    unsigned blinkCount = 0;
+    if (sscanf(text, "blink %u", &blinkCount) == 1 && blinkCount > 0 && blinkCount <= 1000) {
+      ControlCommand cmd{};
+      cmd.type = ControlCommand::BlinkLed;
+      cmd.value = static_cast<uint16_t>(blinkCount);
+      xQueueSend(gControlQueue, &cmd, 0);
+      queueTextReply("ack blink");
+      return;
+    }
+    queueTextReply("err blink");
     return;
   }
 
-  CommandPacket cmd{};
-  const uint16_t copyLen = min<uint16_t>(length, sizeof(cmd.text) - 1);
-  memcpy(cmd.text, payload, copyLen);
-  cmd.text[copyLen] = '\0';
-  Serial.printf("[ESP32 CMD]: %s\n", cmd.text);
+  if (strcmp(text, "reset") == 0) {
+    queueTextReply("ack reset");
+    delay(10);
+    NVIC_SystemReset();
+  }
+
+  if (strcmp(text, "stream on") == 0) {
+    ControlCommand cmd{};
+    cmd.type = ControlCommand::SetStream;
+    cmd.value = 1;
+    xQueueSend(gControlQueue, &cmd, 0);
+    queueTextReply("ack stream on");
+    return;
+  }
+
+  if (strcmp(text, "stream off") == 0) {
+    ControlCommand cmd{};
+    cmd.type = ControlCommand::SetStream;
+    cmd.value = 0;
+    xQueueSend(gControlQueue, &cmd, 0);
+    queueTextReply("ack stream off");
+    return;
+  }
+
+  if (strncmp(text, "ping", 4) == 0) {
+    char pong[kMaxTextPayload - 1] = {0};
+    snprintf(pong, sizeof(pong), "pong %s", text);
+    queueTextReply(pong);
+    return;
+  }
+
+  char generic[kMaxTextPayload - 1] = {0};
+  snprintf(generic, sizeof(generic), "pong %s", text);
+  queueTextReply(generic);
+}
+
+void receiverFunction(uint8_t *payload, uint16_t length, const PJON_Packet_Info &) {
+  if (length < 1) {
+    return;
+  }
+
+  LedEvent ledEv{};
+  ledEv.type = LedEvent::RxPacket;
+  xQueueSend(gLedQueue, &ledEv, 0);
+
+  const PacketType type = static_cast<PacketType>(payload[0]);
+  if (type == PacketType::TextMessage && length > 1) {
+    char text[kMaxTextPayload] = {0};
+    const uint16_t copyLen = min<uint16_t>(length - 1, kMaxTextPayload - 1);
+    memcpy(text, payload + 1, copyLen);
+    text[copyLen] = '\0';
+    handleTextCommand(text);
+  }
 }
 
 void Task_Sensors(void *) {
-  SensorPacket packet{};
+  PayloadSensor packet{};
+  TickType_t periodTicks = SENSOR_POLL_NORMAL;
   TickType_t lastWake = xTaskGetTickCount();
 
   for (;;) {
+    ControlCommand ctrl{};
+    while (xQueueReceive(gControlQueue, &ctrl, 0) == pdPASS) {
+      if (ctrl.type == ControlCommand::SetStream) {
+        periodTicks = (ctrl.value != 0) ? SENSOR_POLL_STREAM : SENSOR_POLL_NORMAL;
+      } else if (ctrl.type == ControlCommand::BlinkLed) {
+        LedEvent led{};
+        led.type = LedEvent::BlinkRequest;
+        led.blink_count = ctrl.value;
+        xQueueSend(gLedQueue, &led, 0);
+      }
+    }
+
+    packet.type = PacketType::SensorData;
     packet.uptime_ms = millis();
     packet.tank_full = (digitalRead(REED_PIN) == LOW) ? 1 : 0;
     packet.moisture_raw[0] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_1));
     packet.moisture_raw[1] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_2));
 
     xQueueOverwrite(gSensorQueue, &packet);
-    vTaskDelayUntil(&lastWake, SENSOR_POLL_PERIOD);
+    vTaskDelayUntil(&lastWake, periodTicks);
   }
 }
 
 void Task_PJON(void *) {
-  SensorPacket packet{};
+  PayloadSensor packet{};
+  BusTxMessage tx{};
+
   for (;;) {
+    while (xQueueReceive(gBusTxQueue, &tx, 0) == pdPASS) {
+      if (tx.len > 0) {
+        bus.send(MASTER_ID, tx.data, tx.len);
+      }
+    }
+
     if (xQueueReceive(gSensorQueue, &packet, 0) == pdPASS) {
       bus.send(MASTER_ID, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
-      LedEvent ev{};
-      ev.tx_tick = xTaskGetTickCount();
-      xQueueSend(gLedQueue, &ev, 0);
     }
+
     bus.receive(5);
     bus.update();
     vTaskDelay(1);
@@ -70,19 +171,32 @@ void Task_PJON(void *) {
 }
 
 void Task_Status_LED(void *) {
-  TickType_t lastTxTick = 0;
+  TickType_t lastRxTick = 0;
   TickType_t lastBlinkTick = xTaskGetTickCount();
+  uint16_t blinkRemaining = 0;
   bool ledState = false;
   setLed(false);
 
   for (;;) {
     LedEvent ev{};
     while (xQueueReceive(gLedQueue, &ev, 0) == pdPASS) {
-      lastTxTick = ev.tx_tick;
+      if (ev.type == LedEvent::RxPacket) {
+        lastRxTick = xTaskGetTickCount();
+      } else if (ev.type == LedEvent::BlinkRequest) {
+        blinkRemaining = static_cast<uint16_t>(ev.blink_count * 2u);
+      }
+    }
+
+    if (blinkRemaining > 0) {
+      ledState = !ledState;
+      setLed(ledState);
+      blinkRemaining--;
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
     }
 
     const TickType_t now = xTaskGetTickCount();
-    const bool busHealthy = (lastTxTick != 0) && ((now - lastTxTick) <= BUS_OK_AGE_TICKS);
+    const bool busHealthy = (lastRxTick != 0) && ((now - lastRxTick) <= BUS_OK_AGE_TICKS);
 
     if (busHealthy) {
       if (!ledState) {
@@ -115,12 +229,14 @@ void setup() {
   bus.set_receiver(receiverFunction);
   bus.begin();
 
-  gSensorQueue = xQueueCreate(1, sizeof(SensorPacket));
-  gLedQueue = xQueueCreate(8, sizeof(LedEvent));
+  gSensorQueue = xQueueCreate(1, sizeof(PayloadSensor));
+  gLedQueue = xQueueCreate(16, sizeof(LedEvent));
+  gControlQueue = xQueueCreate(16, sizeof(ControlCommand));
+  gBusTxQueue = xQueueCreate(8, sizeof(BusTxMessage));
 
-  xTaskCreate(Task_Sensors, "Task_Sensors", 384, nullptr, tskIDLE_PRIORITY + 2, nullptr);
-  xTaskCreate(Task_PJON, "Task_PJON", 512, nullptr, configMAX_PRIORITIES - 1, nullptr);
-  xTaskCreate(Task_Status_LED, "Task_Status_LED", 256, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+  xTaskCreate(Task_Sensors, "Task_Sensors", 512, nullptr, tskIDLE_PRIORITY + 2, nullptr);
+  xTaskCreate(Task_PJON, "Task_PJON", 768, nullptr, configMAX_PRIORITIES - 1, nullptr);
+  xTaskCreate(Task_Status_LED, "Task_Status_LED", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 
   vTaskStartScheduler();
 }
