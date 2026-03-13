@@ -1,17 +1,16 @@
 #include <Arduino.h>
-#include <PJONSoftwareBitBang.h>
 #include <STM32FreeRTOS.h>
 
-#include <cstring>
 #include <atomic>
+#include <cstring>
 
 #include "protocol.h"
 
 namespace {
-constexpr uint8_t BUS_PIN = PA0;
+constexpr uint8_t UART_PIN = PA9;
 constexpr uint8_t REED_PIN = PA1;
-constexpr uint8_t MOISTURE_PIN_1 = PA2;
-constexpr uint8_t MOISTURE_PIN_2 = PA3;
+constexpr uint8_t HW390_PINS[5] = {PA2, PA3, PA4, PA5, PA6};
+constexpr uint8_t LDR_PINS[2] = {PB0, PB1};
 constexpr uint8_t LED_PIN = PC13;
 
 constexpr TickType_t SENSOR_POLL_NORMAL = pdMS_TO_TICKS(2000);
@@ -31,41 +30,48 @@ struct ControlCommand {
 };
 
 struct BusTxMessage {
-  uint16_t len;
-  uint8_t data[kMaxTextPayload];
+  PacketType type;
+  uint8_t len;
+  uint8_t payload[kMaxPayloadSize];
 };
 
 QueueHandle_t gSensorQueue = nullptr;
 QueueHandle_t gLedQueue = nullptr;
 QueueHandle_t gControlQueue = nullptr;
 QueueHandle_t gBusTxQueue = nullptr;
-PJONSoftwareBitBang bus(SLAVE_ID);
 volatile TickType_t gLastMasterPacketTick = 0;
 PayloadSensor gLastSample{};
 volatile bool gLastSampleValid = false;
 std::atomic<uint32_t> gAnnounceCount{0};
+FrameParser gParser;
 
 void setLed(bool on) { digitalWrite(LED_PIN, on ? LOW : HIGH); }
 
 void queueTextReply(const char *text) {
   BusTxMessage out{};
-  out.data[0] = static_cast<uint8_t>(PacketType::TextMessage);
-  const size_t copyLen = strnlen(text, kMaxTextPayload - 2);
-  memcpy(&out.data[1], text, copyLen);
-  out.data[copyLen + 1] = '\0';
-  out.len = static_cast<uint16_t>(copyLen + 2);
+  out.type = PacketType::TextMessage;
+  out.len = static_cast<uint8_t>(strnlen(text, kMaxPayloadSize - 1));
+  memcpy(out.payload, text, out.len);
   xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(10));
 }
 
-
-
-void requestImmediateSensorSend() {
-  if (gLastSampleValid) {
-    xQueueOverwrite(gSensorQueue, &gLastSample);
+void queueSensorReply() {
+  if (!gLastSampleValid) {
+    return;
   }
+  BusTxMessage out{};
+  out.type = PacketType::SensorData;
+  out.len = sizeof(PayloadSensor);
+  memcpy(out.payload, &gLastSample, sizeof(PayloadSensor));
+  xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(10));
 }
 
-void handleTextCommand(const char *text) {
+void handleCommand(const char *text) {
+  if (strcmp(text, "POLL") == 0) {
+    queueSensorReply();
+    return;
+  }
+
   if (strncmp(text, "blink ", 6) == 0) {
     unsigned blinkCount = 0;
     if (sscanf(text, "blink %u", &blinkCount) == 1 && blinkCount > 0 && blinkCount <= 1000) {
@@ -80,10 +86,9 @@ void handleTextCommand(const char *text) {
     return;
   }
 
-  if (strcmp(text, "reset") == 0) {
-    queueTextReply("ack reset");
-    delay(10);
-    NVIC_SystemReset();
+  if (strcmp(text, "flush") == 0) {
+    queueTextReply("ack flush");
+    return;
   }
 
   if (strcmp(text, "stream on") == 0) {
@@ -104,43 +109,47 @@ void handleTextCommand(const char *text) {
     return;
   }
 
-  if (strncmp(text, "ping", 4) == 0) {
-    queueTextReply("pong");
-    return;
-  }
-
-  char generic[kMaxTextPayload - 1] = {0};
+  char generic[kMaxPayloadSize] = {0};
   snprintf(generic, sizeof(generic), "ack %s", text);
   queueTextReply(generic);
 }
 
-void receiverFunction(uint8_t *payload, uint16_t length, const PJON_Packet_Info &) {
-  if (length < 1) {
-    return;
-  }
+void Task_UART(void *) {
+  uint8_t outFrame[kMaxFrameSize] = {0};
 
-  LedEvent ledEv{};
-  ledEv.type = LedEvent::RxPacket;
-  xQueueSend(gLedQueue, &ledEv, 0);
-  gLastMasterPacketTick = xTaskGetTickCount();
+  for (;;) {
+    BusTxMessage tx{};
+    while (xQueueReceive(gBusTxQueue, &tx, 0) == pdPASS) {
+      const size_t len = encodeFrame(tx.type, tx.payload, tx.len, outFrame, sizeof(outFrame));
+      if (len > 0) {
+        Serial1.write(outFrame, len);
+        Serial1.flush();
+      }
+    }
 
-  const PacketType type = static_cast<PacketType>(payload[0]);
-  if (type == PacketType::PollRequest) {
-    requestImmediateSensorSend();
-    return;
-  }
+    while (Serial1.available() > 0) {
+      FrameMessage in{};
+      const uint8_t b = static_cast<uint8_t>(Serial1.read());
+      if (gParser.parseByte(b, in)) {
+        LedEvent ledEv{};
+        ledEv.type = LedEvent::RxPacket;
+        xQueueSend(gLedQueue, &ledEv, 0);
+        gLastMasterPacketTick = xTaskGetTickCount();
 
-  if (type == PacketType::TextMessage && length > 1) {
-    char text[kMaxTextPayload] = {0};
-    const uint16_t copyLen = min<uint16_t>(length - 1, kMaxTextPayload - 1);
-    memcpy(text, payload + 1, copyLen);
-    text[copyLen] = '\0';
-    handleTextCommand(text);
+        if (in.type == PacketType::Command) {
+          char text[kMaxPayloadSize + 1] = {0};
+          memcpy(text, in.payload, in.length);
+          text[in.length] = '\0';
+          handleCommand(text);
+        }
+      }
+    }
+
+    vTaskDelay(1);
   }
 }
 
 void Task_Sensors(void *) {
-  PayloadSensor packet{};
   TickType_t periodTicks = SENSOR_POLL_NORMAL;
   TickType_t lastWake = xTaskGetTickCount();
 
@@ -157,66 +166,43 @@ void Task_Sensors(void *) {
       }
     }
 
-    packet.type = PacketType::SensorData;
-    packet.uptime_ms = millis();
-    packet.tank_full = (digitalRead(REED_PIN) == LOW) ? 1 : 0;
-    packet.moisture_raw[0] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_1));
-    packet.moisture_raw[1] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_2));
+    gLastSample.uptime_ms = millis();
+    gLastSample.tank_full = (digitalRead(REED_PIN) == LOW) ? 1 : 0;
+    for (uint8_t i = 0; i < 5; ++i) {
+      gLastSample.hw390_raw[i] = static_cast<uint16_t>(analogRead(HW390_PINS[i]));
+    }
+    for (uint8_t i = 0; i < 2; ++i) {
+      gLastSample.ldr_raw[i] = static_cast<uint16_t>(analogRead(LDR_PINS[i]));
+    }
+    gLastSample.ds18_c[0] = NAN;
+    gLastSample.ds18_c[1] = NAN;
+    gLastSample.ds18_c[2] = NAN;
 
-    gLastSample = packet;
     gLastSampleValid = true;
-    xQueueOverwrite(gSensorQueue, &packet);
+    xQueueOverwrite(gSensorQueue, &gLastSample);
     vTaskDelayUntil(&lastWake, periodTicks);
   }
 }
 
-
 void Task_Heartbeat(void *) {
   TickType_t lastWake = xTaskGetTickCount();
-
   for (;;) {
     const TickType_t now = xTaskGetTickCount();
     if (gLastMasterPacketTick == 0 || (now - gLastMasterPacketTick) > BUS_OK_AGE_TICKS) {
-      char msg[kMaxTextPayload - 1] = {0};
-      snprintf(msg, sizeof(msg), "hb %lu", static_cast<unsigned long>(millis()));
-      queueTextReply(msg);
+      // Anti-Panik: keine aktive Busübertragung ohne Master-Poll.
     }
     vTaskDelayUntil(&lastWake, HEARTBEAT_PERIOD_TICKS);
   }
 }
 
-
-
 void Task_Announce_Sensor(void *) {
   TickType_t lastWake = xTaskGetTickCount();
-
   for (;;) {
     if (gLastSampleValid) {
       xQueueOverwrite(gSensorQueue, &gLastSample);
       gAnnounceCount.fetch_add(1, std::memory_order_relaxed);
     }
     vTaskDelayUntil(&lastWake, ANNOUNCE_SENSOR_TICKS);
-  }
-}
-
-void Task_PJON(void *) {
-  PayloadSensor packet{};
-  BusTxMessage tx{};
-
-  for (;;) {
-    while (xQueueReceive(gBusTxQueue, &tx, 0) == pdPASS) {
-      if (tx.len > 0) {
-        bus.send(MASTER_ID, tx.data, tx.len);
-      }
-    }
-
-    if (xQueueReceive(gSensorQueue, &packet, 0) == pdPASS) {
-      bus.send(MASTER_ID, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
-    }
-
-    bus.receive(5);
-    bus.update();
-    vTaskDelay(1);
   }
 }
 
@@ -247,7 +233,6 @@ void Task_Status_LED(void *) {
 
     const TickType_t now = xTaskGetTickCount();
     const bool busHealthy = (lastRxTick != 0) && ((now - lastRxTick) <= BUS_OK_AGE_TICKS);
-
     if (busHealthy) {
       if (!ledState) {
         ledState = true;
@@ -266,13 +251,15 @@ void Task_Status_LED(void *) {
 
 void setup() {
   Serial.begin(115200);
+  Serial1.setHalfDuplex();
+  Serial1.begin(115200);
 
+  pinMode(UART_PIN, INPUT_PULLUP);
   pinMode(REED_PIN, INPUT_PULLUP);
-  pinMode(MOISTURE_PIN_1, INPUT_ANALOG);
-  pinMode(MOISTURE_PIN_2, INPUT_ANALOG);
+  for (uint8_t pin : HW390_PINS) pinMode(pin, INPUT_ANALOG);
+  for (uint8_t pin : LDR_PINS) pinMode(pin, INPUT_ANALOG);
   pinMode(LED_PIN, OUTPUT);
   setLed(false);
-
   analogReadResolution(12);
 
   gSensorQueue = xQueueCreate(1, sizeof(PayloadSensor));
@@ -280,12 +267,8 @@ void setup() {
   gControlQueue = xQueueCreate(16, sizeof(ControlCommand));
   gBusTxQueue = xQueueCreate(8, sizeof(BusTxMessage));
 
-  bus.strategy.set_pin(BUS_PIN);
-  bus.set_receiver(receiverFunction);
-  bus.begin();
-
   xTaskCreate(Task_Sensors, "Task_Sensors", 512, nullptr, tskIDLE_PRIORITY + 2, nullptr);
-  xTaskCreate(Task_PJON, "Task_PJON", 768, nullptr, configMAX_PRIORITIES - 1, nullptr);
+  xTaskCreate(Task_UART, "Task_UART", 768, nullptr, configMAX_PRIORITIES - 1, nullptr);
   xTaskCreate(Task_Status_LED, "Task_Status_LED", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   xTaskCreate(Task_Heartbeat, "Task_Heartbeat", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
   xTaskCreate(Task_Announce_Sensor, "Task_Announce_Sensor", 320, nullptr, tskIDLE_PRIORITY + 1, nullptr);
