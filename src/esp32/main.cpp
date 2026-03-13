@@ -1,7 +1,10 @@
 #include <Arduino.h>
-#include <OneWire.h>
 #include <DallasTemperature.h>
+#include <OneWire.h>
 #include <PJONSoftwareBitBang.h>
+
+#include <atomic>
+#include <cmath>
 
 #include "protocol.h"
 
@@ -18,7 +21,14 @@ constexpr uint8_t LED_OFF = LOW;
 
 constexpr TickType_t PUMP_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
-constexpr TickType_t TEMP_POLL_PERIOD = pdMS_TO_TICKS(10000);
+constexpr TickType_t TELEMETRY_PERIOD_TICKS = pdMS_TO_TICKS(2000);
+constexpr TickType_t DS18_SAMPLE_PERIOD_TICKS = pdMS_TO_TICKS(2000);
+
+struct SensorSnapshot {
+  PayloadSensor packet;
+  TickType_t rx_tick;
+  bool valid;
+};
 
 enum class PumpCommandType : uint8_t {
   SensorUpdate,
@@ -26,40 +36,73 @@ enum class PumpCommandType : uint8_t {
   SetModeAuto,
   SetModeManual,
   SetManualMask,
-  SetThreshold
+  SetThreshold,
 };
 
 struct PumpCommand {
   PumpCommandType type;
-  SensorPacket packet;
+  PayloadSensor packet;
   uint8_t manual_mask;
   uint16_t threshold_raw;
 };
 
 enum class LedEventType : uint8_t {
-  RxPacket
+  RxPacket,
 };
 
 struct LedEvent {
   LedEventType type;
 };
 
+struct BusTxMessage {
+  uint16_t len;
+  uint8_t data[kMaxTextPayload];
+};
+
 QueueHandle_t gPumpQueue = nullptr;
 QueueHandle_t gLedQueue = nullptr;
 QueueHandle_t gBusTxQueue = nullptr;
+QueueHandle_t gSensorSnapshotQueue = nullptr;
 TimerHandle_t gPumpTimeoutTimer = nullptr;
 PJONSoftwareBitBang bus(MASTER_ID);
 OneWire oneWire(ONE_WIRE_PIN);
 DallasTemperature ds18b20(&oneWire);
 
+std::atomic<bool> telemetryActive{false};
+std::atomic<float> gTemp0C{NAN};
+std::atomic<float> gTemp1C{NAN};
+std::atomic<uint8_t> gTempSensorCount{0};
+std::atomic<uint8_t> gPumpMask{0};
+
+volatile TickType_t gLastPacketTick = 0;
+
 void setPumps(bool p1_on, bool p2_on, bool p3_on) {
   digitalWrite(PUMP_PIN_1, p1_on ? HIGH : LOW);
   digitalWrite(PUMP_PIN_2, p2_on ? HIGH : LOW);
   digitalWrite(PUMP_PIN_3, p3_on ? HIGH : LOW);
+  uint8_t mask = 0;
+  if (p1_on) {
+    mask |= 0x01u;
+  }
+  if (p2_on) {
+    mask |= 0x02u;
+  }
+  if (p3_on) {
+    mask |= 0x04u;
+  }
+  gPumpMask.store(mask, std::memory_order_relaxed);
 }
 
-void setLed(bool on) {
-  digitalWrite(LED_PIN, on ? LED_ON : LED_OFF);
+void setLed(bool on) { digitalWrite(LED_PIN, on ? LED_ON : LED_OFF); }
+
+void enqueueTextMessage(const String &msg) {
+  BusTxMessage out{};
+  out.data[0] = static_cast<uint8_t>(PacketType::TextMessage);
+  const size_t copied = msg.substring(0, kMaxTextPayload - 2).length();
+  msg.substring(0, kMaxTextPayload - 2).toCharArray(reinterpret_cast<char *>(&out.data[1]), kMaxTextPayload - 1);
+  out.len = static_cast<uint16_t>(copied + 2);
+  out.data[out.len - 1] = '\0';
+  xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(50));
 }
 
 void pumpTimeoutCallback(TimerHandle_t) {
@@ -69,61 +112,136 @@ void pumpTimeoutCallback(TimerHandle_t) {
 }
 
 void receiverFunction(uint8_t *payload, uint16_t length, const PJON_Packet_Info &) {
-  if (length != sizeof(SensorPacket)) {
+  if (length < 1) {
     return;
   }
-
-  PumpCommand cmd{};
-  cmd.type = PumpCommandType::SensorUpdate;
-  memcpy(&cmd.packet, payload, sizeof(SensorPacket));
-  xQueueSend(gPumpQueue, &cmd, 0);
 
   LedEvent ev{};
   ev.type = LedEventType::RxPacket;
   xQueueSend(gLedQueue, &ev, 0);
+
+  gLastPacketTick = xTaskGetTickCount();
+
+  const PacketType type = static_cast<PacketType>(payload[0]);
+  if (type == PacketType::SensorData && length >= sizeof(PayloadSensor)) {
+    PumpCommand cmd{};
+    cmd.type = PumpCommandType::SensorUpdate;
+    memcpy(&cmd.packet, payload, sizeof(PayloadSensor));
+    xQueueSend(gPumpQueue, &cmd, 0);
+
+    SensorSnapshot snap{};
+    memcpy(&snap.packet, payload, sizeof(PayloadSensor));
+    snap.rx_tick = gLastPacketTick;
+    snap.valid = true;
+    xQueueOverwrite(gSensorSnapshotQueue, &snap);
+    return;
+  }
+
+  if (type == PacketType::TextMessage && length > 1) {
+    char text[kMaxTextPayload] = {0};
+    const uint16_t copyLen = min<uint16_t>(length - 1, kMaxTextPayload - 1);
+    memcpy(text, payload + 1, copyLen);
+    text[copyLen] = '\0';
+    Serial.printf("[STM32]: %s\n", text);
+  }
 }
 
 void printHelp() {
   Serial.println(F("[HMI] commands:"));
   Serial.println(F("  help"));
-  Serial.println(F("  mode auto"));
-  Serial.println(F("  mode manual"));
+  Serial.println(F("  mode auto|manual"));
   Serial.println(F("  pump <1|2|3> <on|off>"));
   Serial.println(F("  pump all <on|off>"));
   Serial.println(F("  threshold <raw 0..4095>"));
   Serial.println(F("  timeout <sec>"));
-  Serial.println(F("  ping <text>"));
+  Serial.println(F("  cmd <text>"));
+  Serial.println(F("  telemetry on|off"));
+  Serial.println(F("  status"));
+}
+
+void printTelemetryBlock(const char *reason) {
+  SensorSnapshot snap{};
+  const bool haveSnap = xQueuePeek(gSensorSnapshotQueue, &snap, 0) == pdPASS && snap.valid;
+  const TickType_t now = xTaskGetTickCount();
+  const uint32_t packetAgeMs = (gLastPacketTick == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>((now - gLastPacketTick) * portTICK_PERIOD_MS);
+  const bool online = (gLastPacketTick != 0) && ((now - gLastPacketTick) <= BUS_OK_AGE_TICKS);
+
+  Serial.printf("[TELEMETRY][%s] {heap:%u, slave:%s, packet_age_ms:%lu, ds18_count:%u, ds18_0:%.2f, ds18_1:%.2f, adc_pa2:%u, adc_pa3:%u, tank_full:%u, pumps_mask:0x%02X}\n",
+                reason,
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                online ? "online" : "offline",
+                static_cast<unsigned long>(packetAgeMs),
+                static_cast<unsigned>(gTempSensorCount.load(std::memory_order_relaxed)),
+                gTemp0C.load(std::memory_order_relaxed),
+                gTemp1C.load(std::memory_order_relaxed),
+                haveSnap ? snap.packet.moisture_raw[0] : 0,
+                haveSnap ? snap.packet.moisture_raw[1] : 0,
+                haveSnap ? snap.packet.tank_full : 0,
+                gPumpMask.load(std::memory_order_relaxed));
+}
+
+void printBootManifest() {
+  ds18b20.begin();
+  ds18b20.requestTemperatures();
+  const uint8_t dsCount = ds18b20.getDS18Count();
+  Serial.println(F("========== BOOT MANIFEST =========="));
+  Serial.printf("PJON master id: %u, slave id: %u, bus pin: %u\n", MASTER_ID, SLAVE_ID, BUS_PIN);
+  Serial.printf("Pins: LED=%u, OneWire=%u, Pumps=[%u,%u,%u]\n", LED_PIN, ONE_WIRE_PIN, PUMP_PIN_1, PUMP_PIN_2, PUMP_PIN_3);
+  Serial.printf("OneWire DS18B20 found: %u\n", dsCount);
+  Serial.printf("Free heap: %u bytes\n", static_cast<unsigned>(ESP.getFreeHeap()));
+  Serial.println(F("==================================="));
 }
 
 void Task_PJON_Comms(void *) {
-  CommandPacket outbound{};
+  BusTxMessage outbound{};
 
   for (;;) {
     while (xQueueReceive(gBusTxQueue, &outbound, 0) == pdPASS) {
-      bus.send(SLAVE_ID, reinterpret_cast<const uint8_t *>(outbound.text), strlen(outbound.text));
+      if (outbound.len > 0) {
+        bus.send(SLAVE_ID, outbound.data, outbound.len);
+      }
     }
 
-    bus.receive(50);
+    bus.receive(20);
     bus.update();
     vTaskDelay(1);
   }
 }
 
 void Task_Temperatures(void *) {
-  ds18b20.begin();
-
   for (;;) {
     ds18b20.requestTemperatures();
     const uint8_t count = ds18b20.getDS18Count();
-    for (uint8_t i = 0; i < count; ++i) {
-      const float temp = ds18b20.getTempCByIndex(i);
-      if (temp > -126.0f && temp < 126.0f) {
-        Serial.printf("[TEMP] DS18B20[%u]=%.2fC\n", i, temp);
-      } else {
-        Serial.printf("[TEMP] DS18B20[%u]=invalid\n", i);
+    gTempSensorCount.store(count, std::memory_order_relaxed);
+
+    float t0 = NAN;
+    float t1 = NAN;
+    if (count > 0) {
+      const float temp = ds18b20.getTempCByIndex(0);
+      if (temp != -127.0f && temp != 85.0f && temp > -126.0f && temp < 126.0f) {
+        t0 = temp;
       }
     }
-    vTaskDelay(TEMP_POLL_PERIOD);
+    if (count > 1) {
+      const float temp = ds18b20.getTempCByIndex(1);
+      if (temp != -127.0f && temp != 85.0f && temp > -126.0f && temp < 126.0f) {
+        t1 = temp;
+      }
+    }
+    gTemp0C.store(t0, std::memory_order_relaxed);
+    gTemp1C.store(t1, std::memory_order_relaxed);
+
+    vTaskDelay(DS18_SAMPLE_PERIOD_TICKS);
+  }
+}
+
+void Task_Telemetry(void *) {
+  TickType_t lastWake = xTaskGetTickCount();
+  for (;;) {
+    if (telemetryActive.load(std::memory_order_relaxed)) {
+      printTelemetryBlock("periodic");
+    }
+    vTaskDelayUntil(&lastWake, TELEMETRY_PERIOD_TICKS);
   }
 }
 
@@ -164,89 +282,99 @@ void Task_Pump_Logic(void *) {
   bool autoMode = true;
   uint8_t manualMask = 0;
   uint16_t thresholdRaw = 2200;
+  TickType_t lastSensorRxTick = 0;
 
   for (;;) {
-    if (xQueueReceive(gPumpQueue, &cmd, portMAX_DELAY) != pdPASS) {
-      continue;
-    }
+    if (xQueueReceive(gPumpQueue, &cmd, pdMS_TO_TICKS(200)) == pdPASS) {
+      if (cmd.type == PumpCommandType::SetModeAuto) {
+        autoMode = true;
+        manualMask = 0;
+        setPumps(false, false, false);
+        xTimerStop(gPumpTimeoutTimer, 0);
+        Serial.println(F("[HMI] mode=auto"));
+        continue;
+      }
 
-    if (cmd.type == PumpCommandType::SetModeAuto) {
-      autoMode = true;
-      manualMask = 0;
-      setPumps(false, false, false);
-      xTimerStop(gPumpTimeoutTimer, 0);
-      Serial.println(F("[HMI] mode=auto"));
-      continue;
-    }
+      if (cmd.type == PumpCommandType::SetModeManual) {
+        autoMode = false;
+        manualMask = 0;
+        setPumps(false, false, false);
+        xTimerStop(gPumpTimeoutTimer, 0);
+        Serial.println(F("[HMI] mode=manual"));
+        continue;
+      }
 
-    if (cmd.type == PumpCommandType::SetModeManual) {
-      autoMode = false;
-      manualMask = 0;
-      setPumps(false, false, false);
-      xTimerStop(gPumpTimeoutTimer, 0);
-      Serial.println(F("[HMI] mode=manual"));
-      continue;
-    }
+      if (cmd.type == PumpCommandType::SetThreshold) {
+        thresholdRaw = cmd.threshold_raw;
+        Serial.printf("[HMI] threshold=%u\n", thresholdRaw);
+        continue;
+      }
 
-    if (cmd.type == PumpCommandType::SetThreshold) {
-      thresholdRaw = cmd.threshold_raw;
-      Serial.printf("[HMI] threshold=%u\n", thresholdRaw);
-      continue;
-    }
+      if (cmd.type == PumpCommandType::SetManualMask) {
+        manualMask = cmd.manual_mask & 0x07u;
+        if (!autoMode) {
+          const bool p1 = (manualMask & 0x01u) != 0;
+          const bool p2 = (manualMask & 0x02u) != 0;
+          const bool p3 = (manualMask & 0x04u) != 0;
+          setPumps(p1, p2, p3);
+          if (manualMask != 0) {
+            xTimerReset(gPumpTimeoutTimer, 0);
+          } else {
+            xTimerStop(gPumpTimeoutTimer, 0);
+          }
+        }
+        Serial.printf("[HMI] manual_mask=0x%02X\n", manualMask);
+        continue;
+      }
 
-    if (cmd.type == PumpCommandType::SetManualMask) {
-      manualMask = cmd.manual_mask & 0x07u;
-      if (!autoMode) {
-        const bool p1 = (manualMask & 0x01u) != 0;
-        const bool p2 = (manualMask & 0x02u) != 0;
-        const bool p3 = (manualMask & 0x04u) != 0;
-        setPumps(p1, p2, p3);
-        if (manualMask != 0) {
+      if (cmd.type == PumpCommandType::Timeout) {
+        setPumps(false, false, false);
+        if (!autoMode) {
+          manualMask = 0;
+        }
+        Serial.println(F("[SAFE] Pump timeout -> all OFF"));
+        continue;
+      }
+
+      if (cmd.type == PumpCommandType::SensorUpdate) {
+        lastSensorRxTick = xTaskGetTickCount();
+        if (!autoMode) {
+          continue;
+        }
+
+        const PayloadSensor &p = cmd.packet;
+        if (p.tank_full == 0) {
+          setPumps(false, false, false);
+          xTimerStop(gPumpTimeoutTimer, 0);
+          continue;
+        }
+
+        const bool pump1 = p.moisture_raw[0] < thresholdRaw;
+        const bool pump3 = p.moisture_raw[1] < thresholdRaw;
+
+        setPumps(pump1, false, pump3);
+
+        if (pump1 || pump3) {
           xTimerReset(gPumpTimeoutTimer, 0);
         } else {
           xTimerStop(gPumpTimeoutTimer, 0);
         }
       }
-      Serial.printf("[HMI] manual_mask=0x%02X\n", manualMask);
-      continue;
     }
 
-    if (cmd.type == PumpCommandType::Timeout) {
-      setPumps(false, false, false);
-      if (!autoMode) {
-        manualMask = 0;
-      }
-      Serial.println(F("[SAFE] Pump timeout -> all OFF"));
-      continue;
-    }
-
-    if (cmd.type != PumpCommandType::SensorUpdate || !autoMode) {
-      continue;
-    }
-
-    const SensorPacket &p = cmd.packet;
-    if (p.tank_full == 0) {
+    const TickType_t now = xTaskGetTickCount();
+    if (lastSensorRxTick != 0 && (now - lastSensorRxTick) > BUS_OK_AGE_TICKS) {
+      lastSensorRxTick = 0;
       setPumps(false, false, false);
       xTimerStop(gPumpTimeoutTimer, 0);
-      continue;
-    }
-
-    const bool pump1 = p.moisture_raw[0] < thresholdRaw;
-    const bool pump3 = p.moisture_raw[1] < thresholdRaw;
-
-    setPumps(pump1, false, pump3);
-
-    if (pump1 || pump3) {
-      xTimerReset(gPumpTimeoutTimer, 0);
-    } else {
-      xTimerStop(gPumpTimeoutTimer, 0);
+      Serial.println(F("[SAFE] STM32 offline -> pumps forced OFF"));
     }
   }
 }
 
 void Task_HMI(void *) {
   String line;
-  line.reserve(96);
+  line.reserve(128);
 
   Serial.println(F("[HMI] online. type 'help'"));
 
@@ -266,6 +394,14 @@ void Task_HMI(void *) {
 
         if (line.equalsIgnoreCase("help")) {
           printHelp();
+        } else if (line.equalsIgnoreCase("status")) {
+          printTelemetryBlock("status");
+        } else if (line.equalsIgnoreCase("telemetry on")) {
+          telemetryActive.store(true, std::memory_order_relaxed);
+          Serial.println(F("[HMI] telemetry=on"));
+        } else if (line.equalsIgnoreCase("telemetry off")) {
+          telemetryActive.store(false, std::memory_order_relaxed);
+          Serial.println(F("[HMI] telemetry=off"));
         } else if (line.equalsIgnoreCase("mode auto")) {
           cmd.type = PumpCommandType::SetModeAuto;
           xQueueSend(gPumpQueue, &cmd, pdMS_TO_TICKS(50));
@@ -293,11 +429,7 @@ void Task_HMI(void *) {
               cmd.type = PumpCommandType::SetManualMask;
               cmd.manual_mask = currentMask;
               xQueueSend(gPumpQueue, &cmd, pdMS_TO_TICKS(50));
-            } else {
-              Serial.println(F("[HMI] invalid state, use on/off"));
             }
-          } else {
-            Serial.println(F("[HMI] invalid pump command"));
           }
         } else if (line.startsWith("threshold ")) {
           uint32_t threshold = 0;
@@ -305,34 +437,30 @@ void Task_HMI(void *) {
             cmd.type = PumpCommandType::SetThreshold;
             cmd.threshold_raw = static_cast<uint16_t>(threshold);
             xQueueSend(gPumpQueue, &cmd, pdMS_TO_TICKS(50));
-          } else {
-            Serial.println(F("[HMI] threshold range 0..4095"));
           }
         } else if (line.startsWith("timeout ")) {
           uint32_t timeoutSec = 0;
           if (sscanf(line.c_str(), "timeout %lu", &timeoutSec) == 1 && timeoutSec >= 1 && timeoutSec <= 600) {
             xTimerChangePeriod(gPumpTimeoutTimer, pdMS_TO_TICKS(timeoutSec * 1000UL), pdMS_TO_TICKS(100));
             Serial.printf("[HMI] timeout=%lus\n", static_cast<unsigned long>(timeoutSec));
-          } else {
-            Serial.println(F("[HMI] timeout range 1..600"));
+          }
+        } else if (line.startsWith("cmd ")) {
+          String command = line.substring(4);
+          command.trim();
+          if (!command.isEmpty()) {
+            enqueueTextMessage(command);
+            Serial.printf("[HMI] cmd->STM32: %s\n", command.c_str());
           }
         } else if (line.startsWith("ping ")) {
-          String msg = line.substring(5);
+          String msg = String("ping ") + line.substring(5);
           msg.trim();
-          if (msg.length() == 0) {
-            Serial.println(F("[HMI] ping text missing"));
-          } else {
-            CommandPacket out{};
-            msg.toCharArray(out.text, sizeof(out.text));
-            xQueueSend(gBusTxQueue, &out, pdMS_TO_TICKS(50));
-            Serial.printf("[HMI] ping -> '%s'\n", out.text);
-          }
+          enqueueTextMessage(msg);
         } else {
           Serial.println(F("[HMI] unknown command"));
         }
 
         line.remove(0);
-      } else if (line.length() < 95) {
+      } else if (line.length() < 127) {
         line += c;
       }
     }
@@ -352,9 +480,12 @@ void setup() {
   setPumps(false, false, false);
   setLed(false);
 
+  printBootManifest();
+
   gPumpQueue = xQueueCreate(16, sizeof(PumpCommand));
   gLedQueue = xQueueCreate(16, sizeof(LedEvent));
-  gBusTxQueue = xQueueCreate(8, sizeof(CommandPacket));
+  gBusTxQueue = xQueueCreate(8, sizeof(BusTxMessage));
+  gSensorSnapshotQueue = xQueueCreate(1, sizeof(SensorSnapshot));
   gPumpTimeoutTimer = xTimerCreate("PumpTimeout", PUMP_TIMEOUT_TICKS, pdFALSE, nullptr, pumpTimeoutCallback);
 
   bus.strategy.set_pin(BUS_PIN);
@@ -366,8 +497,7 @@ void setup() {
   xTaskCreatePinnedToCore(Task_Status_LED, "Task_Status_LED", 2048, nullptr, tskIDLE_PRIORITY + 2, nullptr, 1);
   xTaskCreatePinnedToCore(Task_HMI, "Task_HMI", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
   xTaskCreatePinnedToCore(Task_Temperatures, "Task_Temperatures", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
+  xTaskCreatePinnedToCore(Task_Telemetry, "Task_Telemetry", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr, 1);
 }
 
-void loop() {
-  vTaskDelay(portMAX_DELAY);
-}
+void loop() { vTaskDelay(portMAX_DELAY); }
