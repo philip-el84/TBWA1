@@ -1,6 +1,4 @@
 #include <Arduino.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
 #include <PJONSoftwareBitBang.h>
 
 #include <STM32FreeRTOS.h>
@@ -8,13 +6,13 @@
 #include "protocol.h"
 
 namespace {
-constexpr uint8_t BUS_PIN = PB12;
-constexpr uint8_t REED_PIN = PB13;
-constexpr uint8_t ONE_WIRE_PIN = PB14;
+constexpr uint8_t BUS_PIN = PA0;
+constexpr uint8_t REED_PIN = PA1;
+constexpr uint8_t MOISTURE_PIN_1 = PA2;
+constexpr uint8_t MOISTURE_PIN_2 = PA3;
 constexpr uint8_t LED_PIN = PC13;  // Black Pill onboard LED (active low)
 
 constexpr TickType_t SENSOR_POLL_PERIOD = pdMS_TO_TICKS(2000);
-constexpr TickType_t TEMP_POLL_PERIOD = pdMS_TO_TICKS(10000);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
 
 struct LedEvent {
@@ -23,41 +21,33 @@ struct LedEvent {
 
 QueueHandle_t gSensorQueue = nullptr;
 QueueHandle_t gLedQueue = nullptr;
-
-OneWire oneWire(ONE_WIRE_PIN);
-DallasTemperature ds18b20(&oneWire);
 PJONSoftwareBitBang bus(SLAVE_ID);
 
 void setLed(bool on) {
   digitalWrite(LED_PIN, on ? LOW : HIGH);
 }
 
+void receiverFunction(uint8_t *payload, uint16_t length, const PJON_Packet_Info &) {
+  if (length == 0) {
+    return;
+  }
+
+  CommandPacket cmd{};
+  const uint16_t copyLen = min<uint16_t>(length, sizeof(cmd.text) - 1);
+  memcpy(cmd.text, payload, copyLen);
+  cmd.text[copyLen] = '\0';
+  Serial.printf("[ESP32 CMD]: %s\n", cmd.text);
+}
+
 void Task_Sensors(void *) {
   SensorPacket packet{};
   TickType_t lastWake = xTaskGetTickCount();
-  TickType_t lastTempRead = 0;
-
-  ds18b20.begin();
 
   for (;;) {
     packet.uptime_ms = millis();
     packet.tank_full = (digitalRead(REED_PIN) == LOW) ? 1 : 0;
-
-    const TickType_t now = xTaskGetTickCount();
-    if ((now - lastTempRead) >= TEMP_POLL_PERIOD || lastTempRead == 0) {
-      packet.valid_mask = 0;
-      ds18b20.requestTemperatures();
-      for (uint8_t i = 0; i < 2; ++i) {
-        const float temp = ds18b20.getTempCByIndex(i);
-        if (temp > -126.0f && temp < 126.0f) {
-          packet.temp_c[i] = temp;
-          packet.valid_mask |= (1u << i);
-        } else {
-          packet.temp_c[i] = NAN;
-        }
-      }
-      lastTempRead = now;
-    }
+    packet.moisture_raw[0] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_1));
+    packet.moisture_raw[1] = static_cast<uint16_t>(analogRead(MOISTURE_PIN_2));
 
     xQueueOverwrite(gSensorQueue, &packet);
     vTaskDelayUntil(&lastWake, SENSOR_POLL_PERIOD);
@@ -73,6 +63,7 @@ void Task_PJON(void *) {
       ev.tx_tick = xTaskGetTickCount();
       xQueueSend(gLedQueue, &ev, 0);
     }
+    bus.receive(5);
     bus.update();
     vTaskDelay(1);
   }
@@ -110,11 +101,18 @@ void Task_Status_LED(void *) {
 }  // namespace
 
 void setup() {
+  Serial.begin(115200);
+
   pinMode(REED_PIN, INPUT_PULLUP);
+  pinMode(MOISTURE_PIN_1, INPUT_ANALOG);
+  pinMode(MOISTURE_PIN_2, INPUT_ANALOG);
   pinMode(LED_PIN, OUTPUT);
   setLed(false);
 
+  analogReadResolution(12);
+
   bus.strategy.set_pin(BUS_PIN);
+  bus.set_receiver(receiverFunction);
   bus.begin();
 
   gSensorQueue = xQueueCreate(1, sizeof(SensorPacket));
