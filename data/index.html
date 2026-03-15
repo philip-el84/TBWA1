@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Heizungskasten SCADA Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Heizungskasten · SCADA</h1>
+      <p class="subtitle">Live-Monitoring & Steuerung</p>
+    </div>
+    <div class="status-group">
+      <div class="badge" id="wsBadge">WS: Verbinde…</div>
+      <div class="badge" id="onlineBadge">System: Unbekannt</div>
+    </div>
+  </header>
+
+  <main class="dashboard-grid">
+    <section class="card" id="systemCard">
+      <h2>System Status</h2>
+      <div class="kv-grid">
+        <div>Modus</div><div id="modeValue">-</div>
+        <div>Manuell-Maske</div><div id="manualMaskValue">-</div>
+        <div>Pumpen-Maske</div><div id="pumpMaskValue">-</div>
+        <div>Tank Voll</div><div id="tankValue">-</div>
+      </div>
+      <div class="button-row">
+        <button id="modeToggleBtn" class="btn btn-large btn-accent">Lade Modus…</button>
+      </div>
+      <p class="hint">Auto: Sensorgetrieben · Manual: direkte Pumpensteuerung</p>
+    </section>
+
+    <section class="card" id="tempCard">
+      <h2>Temperaturen</h2>
+      <div class="temp-grid">
+        <div class="metric">
+          <div class="label">T0</div>
+          <div class="value" id="temp0">--.- °C</div>
+        </div>
+        <div class="metric">
+          <div class="label">T1</div>
+          <div class="value" id="temp1">--.- °C</div>
+        </div>
+        <div class="metric">
+          <div class="label">T2</div>
+          <div class="value" id="temp2">--.- °C</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="soilCard">
+      <h2>Bodenfeuchte (Sensoren)</h2>
+      <div id="soilList" class="bar-list">
+        <div class="bar-row">
+          <span>S1</span>
+          <div class="bar"><div id="soilBar0" class="fill"></div></div>
+          <span id="soilVal0">-</span>
+        </div>
+        <div class="bar-row">
+          <span>S2</span>
+          <div class="bar"><div id="soilBar1" class="fill"></div></div>
+          <span id="soilVal1">-</span>
+        </div>
+        <div class="bar-row">
+          <span>S3</span>
+          <div class="bar"><div id="soilBar2" class="fill"></div></div>
+          <span id="soilVal2">-</span>
+        </div>
+        <div class="bar-row">
+          <span>S4</span>
+          <div class="bar"><div id="soilBar3" class="fill"></div></div>
+          <span id="soilVal3">-</span>
+        </div>
+        <div class="bar-row">
+          <span>S5</span>
+          <div class="bar"><div id="soilBar4" class="fill"></div></div>
+          <span id="soilVal4">-</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card card-wide" id="pumpCard">
+      <h2>Pumpen & Steuerung</h2>
+
+      <div class="control-block">
+        <h3>Manual Override</h3>
+        <div class="button-row" id="manualButtons">
+          <button class="btn btn-pump" data-pump="0">Pumpe 1</button>
+          <button class="btn btn-pump" data-pump="1">Pumpe 2</button>
+          <button class="btn btn-pump" data-pump="2">Pumpe 3</button>
+        </div>
+      </div>
+
+      <div class="control-block">
+        <h3>Schwellenwerte (Auto Mode)</h3>
+        <div class="slider-grid" id="thresholdGrid">
+          <label>
+            Pumpe 1 Threshold
+            <input type="range" min="0" max="4095" step="1" id="threshold0" />
+            <span id="thresholdVal0">-</span>
+          </label>
+          <label>
+            Pumpe 2 Threshold
+            <input type="range" min="0" max="4095" step="1" id="threshold1" />
+            <span id="thresholdVal1">-</span>
+          </label>
+          <label>
+            Pumpe 3 Threshold
+            <input type="range" min="0" max="4095" step="1" id="threshold2" />
+            <span id="thresholdVal2">-</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="control-block">
+        <h3>Ramp Speed & Max PWM</h3>
+        <div class="slider-grid">
+          <label>
+            Ramp Speed (ms/Step)
+            <input type="range" min="1" max="500" step="1" id="rampSpeed" />
+            <span id="rampSpeedVal">-</span>
+          </label>
+          <label>
+            Sicherheits-Timeout (Sekunden)
+            <input type="range" min="0" max="60" step="1" id="pumpTimeoutS" />
+            <span id="pumpTimeoutVal">-</span>
+          </label>
+          <label>
+            Pumpe 1 Max PWM
+            <input type="range" min="0" max="255" step="1" id="maxPwm0" />
+            <span id="maxPwmVal0">-</span>
+          </label>
+          <label>
+            Pumpe 2 Max PWM
+            <input type="range" min="0" max="255" step="1" id="maxPwm1" />
+            <span id="maxPwmVal1">-</span>
+          </label>
+          <label>
+            Pumpe 3 Max PWM
+            <input type="range" min="0" max="255" step="1" id="maxPwm2" />
+            <span id="maxPwmVal2">-</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="pump-live-grid" id="pumpLiveGrid">
+        <div class="pump-live">
+          <strong>Pumpe 1</strong>
+          <span id="pumpCurrent0">Ist: -</span>
+          <span id="pumpTarget0">Soll: -</span>
+        </div>
+        <div class="pump-live">
+          <strong>Pumpe 2</strong>
+          <span id="pumpCurrent1">Ist: -</span>
+          <span id="pumpTarget1">Soll: -</span>
+        </div>
+        <div class="pump-live">
+          <strong>Pumpe 3</strong>
+          <span id="pumpCurrent2">Ist: -</span>
+          <span id="pumpTarget2">Soll: -</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
