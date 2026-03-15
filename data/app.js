@@ -3,6 +3,7 @@ const state = {
   mode: 'auto',
   manual_mask: 0,
   ramp_speed: 20,
+  pump_timeout_s: 10,
   lastPayload: null,
 };
 
@@ -26,6 +27,8 @@ const els = {
   maxPwmVals: [0, 1, 2].map((i) => document.getElementById(`maxPwmVal${i}`)),
   rampSpeed: document.getElementById('rampSpeed'),
   rampSpeedVal: document.getElementById('rampSpeedVal'),
+  pumpTimeoutS: document.getElementById('pumpTimeoutS'),
+  pumpTimeoutVal: document.getElementById('pumpTimeoutVal'),
   pumpCurrent: [0, 1, 2].map((i) => document.getElementById(`pumpCurrent${i}`)),
   pumpTarget: [0, 1, 2].map((i) => document.getElementById(`pumpTarget${i}`)),
   pumpLive: [...document.querySelectorAll('.pump-live')],
@@ -43,6 +46,11 @@ function moistPercent(raw) {
 function fmtTemp(v) {
   if (typeof v !== 'number' || Number.isNaN(v)) return '--.- °C';
   return `${v.toFixed(1)} °C`;
+}
+
+function fmtTimeoutSec(v) {
+  const n = Number(v) || 0;
+  return n === 0 ? '0 (Unendlich)' : `${n} s`;
 }
 
 async function postConfig(payload) {
@@ -90,6 +98,8 @@ function updateFromPayload(payload) {
   state.lastPayload = payload;
   state.mode = payload.mode || state.mode;
   state.manual_mask = Number(payload.manual_mask || 0);
+  if (payload.ramp_speed !== undefined) state.ramp_speed = Number(payload.ramp_speed || 1);
+  if (payload.pump_timeout_s !== undefined) state.pump_timeout_s = Number(payload.pump_timeout_s || 0);
 
   setBadge(els.onlineBadge, payload.online ? 'System: Online' : 'System: Offline', !!payload.online);
   els.modeValue.textContent = state.mode.toUpperCase();
@@ -130,6 +140,12 @@ function updateFromPayload(payload) {
     updateSliderValue(els.maxPwm[i], maxPwm[i]);
     els.maxPwmVals[i].textContent = String(maxPwm[i]);
   }
+
+  updateSliderValue(els.rampSpeed, state.ramp_speed);
+  els.rampSpeedVal.textContent = String(state.ramp_speed);
+
+  updateSliderValue(els.pumpTimeoutS, state.pump_timeout_s);
+  els.pumpTimeoutVal.textContent = fmtTimeoutSec(state.pump_timeout_s);
 
   applyModeUi();
 }
@@ -184,8 +200,17 @@ function setupControls() {
     postConfig({ ramp_speed: value });
   });
 
+  els.pumpTimeoutS.addEventListener('input', () => {
+    const value = Number(els.pumpTimeoutS.value);
+    state.pump_timeout_s = value;
+    els.pumpTimeoutVal.textContent = fmtTimeoutSec(value);
+    postConfig({ pump_timeout_s: value });
+  });
+
   els.rampSpeed.value = state.ramp_speed;
   els.rampSpeedVal.textContent = String(state.ramp_speed);
+  els.pumpTimeoutS.value = state.pump_timeout_s;
+  els.pumpTimeoutVal.textContent = fmtTimeoutSec(state.pump_timeout_s);
 }
 
 function connectWebSocket() {

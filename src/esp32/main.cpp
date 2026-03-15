@@ -8,6 +8,7 @@
 #include <OneWire.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 #include "soc/gpio_struct.h"
 #include <atomic>
 #include <cmath>
@@ -28,7 +29,6 @@ constexpr uint32_t kPwmFrequencyHz = 2000;
 constexpr uint8_t kPwmChannels[kPumpCount] = {0, 1, 2};
 constexpr uint8_t kPumpPins[kPumpCount] = {PUMP_PIN_1, PUMP_PIN_2, PUMP_PIN_3};
 
-constexpr TickType_t PUMP_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
 constexpr TickType_t BUS_OK_AGE_TICKS = pdMS_TO_TICKS(5000);
 constexpr TickType_t TELEMETRY_PERIOD_TICKS = pdMS_TO_TICKS(2000);
 constexpr TickType_t DS18_SAMPLE_PERIOD_TICKS = pdMS_TO_TICKS(2000);
@@ -83,6 +83,7 @@ DallasTemperature ds18b20(&oneWire);
 FrameParser gParser;
 AsyncWebServer gServer(80);
 AsyncWebSocket gWs("/ws");
+Preferences preferences;
 
 std::atomic<bool> telemetryActive{false};
 std::atomic<float> gTemp0C{NAN}, gTemp1C{NAN}, gTemp2C{NAN};
@@ -92,6 +93,7 @@ std::atomic<uint8_t> gTargetPwm[kPumpCount];
 std::atomic<uint8_t> gMaxPwmValue[kPumpCount];
 std::atomic<uint16_t> gPumpThresholds[kPumpCount];
 std::atomic<uint16_t> gRampSpeedMs{20};
+std::atomic<uint32_t> gPumpTimeoutMs{10000};
 std::atomic<bool> gAutoMode{true};
 std::atomic<uint8_t> gManualMask{0};
 volatile TickType_t gLastPacketTick = 0;
@@ -136,6 +138,16 @@ void pumpTimeoutCallback(TimerHandle_t) {
   xQueueSend(gPumpQueue, &cmd, 0);
 }
 
+void armPumpTimeoutTimer() {
+  const uint32_t timeoutMs = gPumpTimeoutMs.load(std::memory_order_relaxed);
+  if (timeoutMs == 0) {
+    xTimerStop(gPumpTimeoutTimer, 0);
+    return;
+  }
+  xTimerChangePeriod(gPumpTimeoutTimer, pdMS_TO_TICKS(timeoutMs), 0);
+  xTimerReset(gPumpTimeoutTimer, 0);
+}
+
 void pushTelemetryJson() {
   SensorSnapshot snap{};
   const bool haveSnap = xQueuePeek(gSensorSnapshotQueue, &snap, 0) == pdPASS && snap.valid;
@@ -145,6 +157,8 @@ void pushTelemetryJson() {
   doc["manual_mask"] = gManualMask.load(std::memory_order_relaxed);
   doc["pump_mask"] = gPumpMask.load(std::memory_order_relaxed);
   doc["online"] = haveSnap;
+  doc["ramp_speed"] = gRampSpeedMs.load(std::memory_order_relaxed);
+  doc["pump_timeout_s"] = gPumpTimeoutMs.load(std::memory_order_relaxed) / 1000;
   JsonObject temp = doc.createNestedObject("temperature_c");
   temp["t0"] = gTemp0C.load(std::memory_order_relaxed);
   temp["t1"] = gTemp1C.load(std::memory_order_relaxed);
@@ -206,20 +220,36 @@ void handleApiConfig(AsyncWebServerRequest *request, const uint8_t *data, size_t
 
   if (doc.containsKey("ramp_speed")) {
     const uint16_t rampMs = static_cast<uint16_t>(doc["ramp_speed"].as<uint32_t>());
-    gRampSpeedMs.store(max<uint16_t>(1, rampMs), std::memory_order_relaxed);
+    const uint16_t safeRampMs = max<uint16_t>(1, rampMs);
+    gRampSpeedMs.store(safeRampMs, std::memory_order_relaxed);
+    preferences.putUShort("ramp_ms", safeRampMs);
+  }
+
+  if (doc.containsKey("pump_timeout_s")) {
+    const uint32_t timeoutS = static_cast<uint32_t>(constrain(doc["pump_timeout_s"].as<int>(), 0, 60));
+    gPumpTimeoutMs.store(timeoutS * 1000u, std::memory_order_relaxed);
+    preferences.putUInt("timeout_s", timeoutS);
   }
 
   if (doc.containsKey("max_pwm_value") && doc["max_pwm_value"].is<JsonArray>()) {
     JsonArray values = doc["max_pwm_value"].as<JsonArray>();
     for (uint8_t i = 0; i < kPumpCount && i < values.size(); ++i) {
-      gMaxPwmValue[i].store(static_cast<uint8_t>(constrain(values[i].as<int>(), 0, 255)), std::memory_order_relaxed);
+      const uint8_t pwm = static_cast<uint8_t>(constrain(values[i].as<int>(), 0, 255));
+      gMaxPwmValue[i].store(pwm, std::memory_order_relaxed);
+      char key[8];
+      snprintf(key, sizeof(key), "max%u", i);
+      preferences.putUChar(key, pwm);
     }
   }
 
   if (doc.containsKey("pump_thresholds") && doc["pump_thresholds"].is<JsonArray>()) {
     JsonArray values = doc["pump_thresholds"].as<JsonArray>();
     for (uint8_t i = 0; i < kPumpCount && i < values.size(); ++i) {
-      gPumpThresholds[i].store(static_cast<uint16_t>(values[i].as<uint32_t>()), std::memory_order_relaxed);
+      const uint16_t threshold = static_cast<uint16_t>(constrain(values[i].as<int>(), 0, 4095));
+      gPumpThresholds[i].store(threshold, std::memory_order_relaxed);
+      char key[8];
+      snprintf(key, sizeof(key), "thr%u", i);
+      preferences.putUShort(key, threshold);
     }
     PumpCommand cmd{};
     cmd.type = PumpCommandType::SetThreshold;
@@ -256,6 +286,8 @@ void configureWebServer() {
     doc["mode"] = gAutoMode.load(std::memory_order_relaxed) ? "auto" : "manual";
     doc["manual_mask"] = gManualMask.load(std::memory_order_relaxed);
     doc["pump_mask"] = gPumpMask.load(std::memory_order_relaxed);
+    doc["ramp_speed"] = gRampSpeedMs.load(std::memory_order_relaxed);
+    doc["pump_timeout_s"] = gPumpTimeoutMs.load(std::memory_order_relaxed) / 1000;
     String json;
     serializeJson(doc, json);
     request->send(200, "application/json", json);
@@ -372,7 +404,7 @@ void Task_Pump_Logic(void *) {
         if (!gAutoMode.load(std::memory_order_relaxed)) {
           setPumpTargetsFromMask(manualMask);
           if (manualMask != 0) {
-            xTimerReset(gPumpTimeoutTimer, 0);
+            armPumpTimeoutTimer();
           } else {
             xTimerStop(gPumpTimeoutTimer, 0);
           }
@@ -403,7 +435,7 @@ void Task_Pump_Logic(void *) {
         }
         setPumpTargetsFromMask(autoMask);
         if (autoMask != 0) {
-          xTimerReset(gPumpTimeoutTimer, 0);
+          armPumpTimeoutTimer();
         } else {
           xTimerStop(gPumpTimeoutTimer, 0);
         }
@@ -565,11 +597,21 @@ void setup() {
   Serial2.begin(9600, SERIAL_8N1, 16, 17);
 
   pinMode(LED_PIN, OUTPUT);
+  preferences.begin("scada", false);
+  const uint16_t storedRampMs = preferences.getUShort("ramp_ms", 20);
+  const uint32_t storedTimeoutS = preferences.getUInt("timeout_s", 10);
+  gRampSpeedMs.store(max<uint16_t>(1, storedRampMs), std::memory_order_relaxed);
+  gPumpTimeoutMs.store(constrain(storedTimeoutS, 0u, 60u) * 1000u, std::memory_order_relaxed);
+
   for (uint8_t i = 0; i < kPumpCount; ++i) {
     gCurrentPwm[i].store(0, std::memory_order_relaxed);
     gTargetPwm[i].store(0, std::memory_order_relaxed);
-    gMaxPwmValue[i].store(255, std::memory_order_relaxed);
-    gPumpThresholds[i].store(2200, std::memory_order_relaxed);
+    char maxKey[8];
+    char thrKey[8];
+    snprintf(maxKey, sizeof(maxKey), "max%u", i);
+    snprintf(thrKey, sizeof(thrKey), "thr%u", i);
+    gMaxPwmValue[i].store(preferences.getUChar(maxKey, 255), std::memory_order_relaxed);
+    gPumpThresholds[i].store(preferences.getUShort(thrKey, 2200), std::memory_order_relaxed);
   }
   for (uint8_t i = 0; i < kPumpCount; ++i) {
     ledcSetup(kPwmChannels[i], kPwmFrequencyHz, kPwmResolutionBits);
@@ -582,7 +624,7 @@ void setup() {
   gBusTxQueue = xQueueCreate(16, sizeof(BusTxMessage));
   gSensorSnapshotQueue = xQueueCreate(1, sizeof(SensorSnapshot));
   gPwmTargetQueue = xQueueCreate(16, sizeof(PwmTargetMessage));
-  gPumpTimeoutTimer = xTimerCreate("PumpTimeout", PUMP_TIMEOUT_TICKS, pdFALSE, nullptr, pumpTimeoutCallback);
+  gPumpTimeoutTimer = xTimerCreate("PumpTimeout", pdMS_TO_TICKS(gPumpTimeoutMs.load(std::memory_order_relaxed)), pdFALSE, nullptr, pumpTimeoutCallback);
 
   xTaskCreatePinnedToCore(Task_UART_Comms, "Task_UART_Comms", 4096, nullptr, configMAX_PRIORITIES - 1, nullptr, 0);
   xTaskCreatePinnedToCore(Task_Pump_Logic, "Task_Pump_Logic", 4096, nullptr, tskIDLE_PRIORITY + 3, nullptr, 1);
