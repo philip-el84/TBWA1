@@ -87,10 +87,10 @@ AsyncWebSocket gWs("/ws");
 std::atomic<bool> telemetryActive{false};
 std::atomic<float> gTemp0C{NAN}, gTemp1C{NAN}, gTemp2C{NAN};
 std::atomic<uint8_t> gPumpMask{0};
-std::atomic<uint8_t> gCurrentPwm[kPumpCount] = {0, 0, 0};
-std::atomic<uint8_t> gTargetPwm[kPumpCount] = {0, 0, 0};
-std::atomic<uint8_t> gMaxPwmValue[kPumpCount] = {255, 255, 255};
-std::atomic<uint16_t> gPumpThresholds[kPumpCount] = {2200, 2200, 2200};
+std::atomic<uint8_t> gCurrentPwm[kPumpCount];
+std::atomic<uint8_t> gTargetPwm[kPumpCount];
+std::atomic<uint8_t> gMaxPwmValue[kPumpCount];
+std::atomic<uint16_t> gPumpThresholds[kPumpCount];
 std::atomic<uint16_t> gRampSpeedMs{20};
 std::atomic<bool> gAutoMode{true};
 std::atomic<uint8_t> gManualMask{0};
@@ -565,6 +565,12 @@ void setup() {
   Serial2.begin(9600, SERIAL_8N1, 16, 17);
 
   pinMode(LED_PIN, OUTPUT);
+  for (uint8_t i = 0; i < kPumpCount; ++i) {
+    gCurrentPwm[i].store(0, std::memory_order_relaxed);
+    gTargetPwm[i].store(0, std::memory_order_relaxed);
+    gMaxPwmValue[i].store(255, std::memory_order_relaxed);
+    gPumpThresholds[i].store(2200, std::memory_order_relaxed);
+  }
   for (uint8_t i = 0; i < kPumpCount; ++i) {
     ledcSetup(kPwmChannels[i], kPwmFrequencyHz, kPwmResolutionBits);
     ledcAttachPin(kPumpPins[i], kPwmChannels[i]);
