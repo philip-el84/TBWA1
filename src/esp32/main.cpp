@@ -1,10 +1,10 @@
 #include <Arduino.h>
 #include <DallasTemperature.h>
 #include <OneWire.h>
-
+#include "soc/gpio_struct.h"
 #include <atomic>
 #include <cmath>
-
+#include "driver/gpio.h"
 #include "protocol.h"
 
 namespace {
@@ -120,12 +120,17 @@ void Task_UART_Comms(void *) {
   for (;;) {
     BusTxMessage outbound{};
     while (xQueueReceive(gBusTxQueue, &outbound, 0) == pdPASS) {
-      const size_t len = encodeFrame(outbound.type, outbound.payload, outbound.len, frame, sizeof(frame));
-      if (len > 0) {
-        Serial2.write(frame, len);
-        Serial2.flush();
-      }
-    }
+          const size_t len = encodeFrame(outbound.type, outbound.payload, outbound.len, frame, sizeof(frame));
+          if (len > 0) {
+            Serial2.write(frame, len);
+            Serial2.flush();
+
+            // --- DIE ECHO-VERNICHTUNG ---
+            while (Serial2.available() > 0) {
+              Serial2.read();
+            }
+          }
+        }
 
     while (Serial2.available() > 0) {
       const uint8_t b = static_cast<uint8_t>(Serial2.read());
@@ -258,8 +263,8 @@ void Task_HMI(void *) {
       if (c == '\r') continue;
       if (c == '\n') {
         line.trim();
-        if (line.equalsIgnoreCase("telemetry on")) telemetryActive.store(true, std::memory_order_relaxed);
-        else if (line.equalsIgnoreCase("telemetry off")) telemetryActive.store(false, std::memory_order_relaxed);
+        if (line.equalsIgnoreCase("tel on")) telemetryActive.store(true, std::memory_order_relaxed);
+        else if (line.equalsIgnoreCase("tel off")) telemetryActive.store(false, std::memory_order_relaxed);
         else if (line.startsWith("cmd ")) {
           const String cmd = line.substring(4);
           sendCommand(cmd.c_str());
@@ -275,8 +280,8 @@ void Task_HMI(void *) {
 }  // namespace
 
 void setup() {
-  Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, UART_PIN, UART_PIN);
+  Serial.begin(9600);
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
 
   pinMode(PUMP_PIN_1, OUTPUT);
   pinMode(PUMP_PIN_2, OUTPUT);
